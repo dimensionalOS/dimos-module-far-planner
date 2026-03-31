@@ -22,7 +22,11 @@ add_definitions(-DUSE_PCL)
 find_package(OpenCV QUIET COMPONENTS core imgproc)
 
 if(NOT DEFINED SMARTNAV_COMMON_DIR)
-  set(SMARTNAV_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    set(SMARTNAV_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
+  else()
+    set(SMARTNAV_COMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common)
+  endif()
 endif()
 
 add_executable(far_planner main.cpp)
