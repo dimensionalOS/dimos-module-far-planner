@@ -45,7 +45,9 @@
 
 #include "sensor_msgs/PointCloud2.hpp"
 #include "nav_msgs/Odometry.hpp"
+#include "nav_msgs/Path.hpp"
 #include "geometry_msgs/PointStamped.hpp"
+#include "geometry_msgs/PoseStamped.hpp"
 
 #ifdef USE_PCL
 #include <pcl/point_types.h>
@@ -2244,10 +2246,10 @@ struct MapHandler {
             float t = (float)s / (float)n_steps;
             float px = p1.x + dx * t;
             float py = p1.y + dy * t;
-            // Skip endpoints (within 1m of start/end) to avoid self-blocking
+            // Skip endpoints (within 0.2m of start/end) to avoid self-blocking
             float d1 = std::sqrt((px-p1.x)*(px-p1.x)+(py-p1.y)*(py-p1.y));
             float d2 = std::sqrt((px-p2.x)*(px-p2.x)+(py-p2.y)*(py-p2.y));
-            if (d1 < 0.5f || d2 < 0.5f) continue;
+            if (d1 < 0.2f || d2 < 0.2f) continue;
 
             // Check the grid cell and neighbors for obstacle points near the line
             Eigen::Vector3d pos(px, py, p1.z);
@@ -2267,7 +2269,7 @@ struct MapHandler {
                         // 2D distance from point to line segment
                         float apx = pt.x - p1.x, apy = pt.y - p1.y;
                         float proj = apx*ux + apy*uy;
-                        if (proj < 0.5f || proj > dist - 0.5f) continue;
+                        if (proj < 0.2f || proj > dist - 0.2f) continue;
                         float perp = std::abs(apx*(-uy) + apy*ux);
                         if (perp < half_dim) {
                             blocked_count++;
@@ -2429,6 +2431,7 @@ int main(int argc, char** argv) {
     std::string topic_odom        = mod.topic("odometry");
     std::string topic_goal        = mod.topic("goal");
     std::string topic_wp          = mod.topic("way_point");
+    std::string topic_goal_path   = mod.topic("goal_path");
 
     // LCM subscribe requires member-function + object pointer; wrap free fns
     // in a trivial handler struct.
@@ -2488,7 +2491,10 @@ int main(int argc, char** argv) {
     map_handler.Init();
     // Set up the ray-cast obstacle check callback
     g_obstacle_raycast = [&map_handler](const Point3D& p1, const Point3D& p2) -> bool {
-        return map_handler.IsEdgeBlockedByObstacles(p1, p2, G.robot_dim, 5);
+        // Use wider corridor (1.5x robot dim) for better wall detection, and
+        // lower threshold (3 blocked pts) to catch walls while allowing
+        // navigation near furniture.
+        return map_handler.IsEdgeBlockedByObstacles(p1, p2, G.robot_dim * 1.5f, 3);
     };
 #endif
 
@@ -2754,6 +2760,23 @@ int main(int argc, char** argv) {
                 // data. The local planner only uses x,y for 2D path generation.
                 wp_msg.point.z = odom_node->position.z;
                 lcm.publish(topic_wp, &wp_msg);
+
+                // Publish full planned path for visualization
+                {
+                    nav_msgs::Path path_msg;
+                    path_msg.header = wp_msg.header;
+                    path_msg.poses_length = static_cast<int32_t>(global_path.size());
+                    path_msg.poses.resize(global_path.size());
+                    for (std::size_t i = 0; i < global_path.size(); i++) {
+                        auto& ps = path_msg.poses[i];
+                        ps.header = wp_msg.header;
+                        ps.pose.position.x = global_path[i]->position.x;
+                        ps.pose.position.y = global_path[i]->position.y;
+                        ps.pose.position.z = odom_node->position.z;
+                        ps.pose.orientation.w = 1.0;
+                    }
+                    lcm.publish(topic_goal_path, &path_msg);
+                }
 
                 float dist_to_goal = (odom_node->position - cur_goal).norm_flat();
                 if (verbose) {
