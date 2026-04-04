@@ -857,6 +857,67 @@ static bool IsEdgeCollidePoly(const PointStack& poly, const ConnectPair& edge) {
     }
     return false;
 }
+// ---------------------------------------------------------------------------
+//  Goal reprojection — move goal from inside polygon to free space nearby
+//  Ref: contour_graph.cpp:546-586  ReprojectPointOutsidePolygons
+// ---------------------------------------------------------------------------
+#ifdef HAS_OPENCV
+// Returns true if point was moved (was inside a polygon). Moves it to just
+// outside the nearest polygon vertex by free_radius distance.
+static bool ReprojectPointOutsidePolygons(Point3D& point, float free_radius) {
+    for (const auto& poly : g_contour_polygons) {
+        if (poly->is_pillar) continue;
+        if (!G.PointInsideAPoly(poly->vertices, point)) continue;
+        // Point is inside this polygon, but odom should be outside
+        if (G.PointInsideAPoly(poly->vertices, G.odom_pos)) continue;
+        // Find nearest vertex and project outward
+        float near_dist = G.kINF;
+        Point3D reproject_p = point;
+        Point3D free_dir(0, 0, -1);
+        int N = (int)poly->vertices.size();
+        for (int idx = 0; idx < N; idx++) {
+            Point3D vertex(poly->vertices[idx].x, poly->vertices[idx].y, point.z);
+            float temp_dist = (vertex - point).norm_flat();
+            if (temp_dist < near_dist) {
+                // Compute outward direction at this vertex
+                int prev_i = G.Mod(idx-1, N), next_i = G.Mod(idx+1, N);
+                Point3D prev(poly->vertices[prev_i].x, poly->vertices[prev_i].y, point.z);
+                Point3D next(poly->vertices[next_i].x, poly->vertices[next_i].y, point.z);
+                float len1 = (prev - vertex).norm_flat();
+                float len2 = (next - vertex).norm_flat();
+                if (len1 < 0.001f || len2 < 0.001f) continue;
+                Point3D d1 = (prev - vertex) * (1.0f / len1);
+                Point3D d2 = (next - vertex) * (1.0f / len2);
+                Point3D d = d1 + d2;
+                float dlen = d.norm_flat();
+                if (dlen < 0.001f) continue;
+                d = d * (1.0f / dlen);
+                // Check if this direction points outward (test point + small step)
+                Point3D test = vertex;
+                test.x += d.x * G.kLeafSize; test.y += d.y * G.kLeafSize;
+                if (G.PointInsideAPoly(poly->vertices, test)) {
+                    // Convex vertex — direction points inside, use it
+                    reproject_p = vertex;
+                    near_dist = temp_dist;
+                    free_dir = d;
+                }
+            }
+        }
+        if (near_dist < G.kINF) {
+            float orig_z = point.z;
+            point.x = reproject_p.x - free_dir.x * free_radius;
+            point.y = reproject_p.y - free_dir.y * free_radius;
+            point.z = orig_z;
+            printf("[FAR] Goal reprojected from inside polygon to (%.2f, %.2f)\n", point.x, point.y);
+            return true;
+        }
+    }
+    return false;
+}
+#else
+static bool ReprojectPointOutsidePolygons(Point3D&, float) { return false; }
+#endif
+
 // Ref: contour_graph.cpp:94-112  IsNavNodesConnectFreePolygon
 // Ref: contour_graph.cpp:156-208  IsPointsConnectFreePolygon
 static bool IsNavNodesConnectFreePolygon(const NavNodePtr& n1, const NavNodePtr& n2) {
@@ -876,15 +937,29 @@ static bool IsNavNodesConnectFreePolygon(const NavNodePtr& n1, const NavNodePtr&
             if (IsEdgeCollideSegment(c, cedge)) return false;
         }
     }
-    // Skip collision check against a node's own source polygon —
-    // contour-derived nodes sit just outside their polygon, so the
-    // edge to/from them would always graze it.
+    // Polygon collision check with center-point same-side test.
+    // Ref: contour_graph.cpp:172-181 IsPointsConnectFreePolygon (local check branch)
+    // A polygon blocks an edge only if the edge center is on the OPPOSITE side
+    // from the robot (i.e., inside the polygon when robot is outside, or vice versa).
+    // This allows edges within the same "free space" region (including room interiors)
+    // even if the polygon encloses both endpoints.
+    // Additionally, skip the source polygon of either endpoint (pointer-match within
+    // the current frame — works because CTNodes hold refs to current-frame polygons).
     auto skip1 = n1->ctnode ? n1->ctnode->poly_ptr : nullptr;
     auto skip2 = n2->ctnode ? n2->ctnode->poly_ptr : nullptr;
+    Point3D center((n1->position.x + n2->position.x) * 0.5f,
+                   (n1->position.y + n2->position.y) * 0.5f,
+                   (n1->position.z + n2->position.z) * 0.5f);
     for (const auto& poly : g_contour_polygons) {
         if (poly->is_pillar) continue;
         if (poly == skip1 || poly == skip2) continue;
-        if (IsEdgeCollidePoly(poly->vertices, cedge)) return false;
+        // Center-point same-side test: block only if center is on opposite side from robot
+        // Ref: contour_graph.cpp:175 is_robot_inside != PointInsideAPoly(vertices, center_p)
+        bool center_inside = G.PointInsideAPoly(poly->vertices, center);
+        if (poly->is_robot_inside != center_inside) {
+            // Center is on the opposite side from the robot — also check edge collision
+            if (IsEdgeCollidePoly(poly->vertices, cedge)) return false;
+        }
     }
     return true;
 }
@@ -964,6 +1039,7 @@ struct GraphPlanner {
 
     void UpdateGoalConnects(const NavNodePtr& goal_ptr) {
         if (!goal_ptr || is_use_internav_goal) return;
+        int poly_blocked = 0, ray_blocked = 0, connected = 0;
         for (const auto& n : current_graph) {
             if (n == goal_ptr) continue;
             // Connect goal to any visible node (not just traversable ones).
@@ -971,18 +1047,31 @@ struct GraphPlanner {
             // goal edges to traversable nodes creates a circular dependency
             // when the odom-to-graph connectivity is sparse.
             bool poly_free = IsNavNodesConnectFreePolygon(n, goal_ptr);
+            bool ray_free = true;
             // Ray-cast sanity check against accumulated obstacle cloud.
             if (poly_free && g_obstacle_raycast) {
-                if (g_obstacle_raycast(n->position, goal_ptr->position))
+                if (g_obstacle_raycast(n->position, goal_ptr->position)) {
                     poly_free = false;
+                    ray_free = false;
+                }
             }
             if (poly_free) {
                 AddPolyEdge(n, goal_ptr); AddEdge(n, goal_ptr);
                 n->is_block_to_goal = false;
+                connected++;
             } else {
                 ErasePolyEdge(n, goal_ptr); EraseEdge(n, goal_ptr);
                 n->is_block_to_goal = true;
+                if (!ray_free) ray_blocked++;
+                else poly_blocked++;
             }
+        }
+        static int goal_dbg_ctr = 0;
+        if (++goal_dbg_ctr % 5 == 0) {
+            printf("[FAR] GoalConnect: goal=(%.2f,%.2f) connected=%d poly_blocked=%d ray_blocked=%d total=%zu\n",
+                   goal_ptr->position.x, goal_ptr->position.y,
+                   connected, poly_blocked, ray_blocked, current_graph.size());
+            fflush(stdout);
         }
     }
 
@@ -1011,11 +1100,15 @@ struct GraphPlanner {
     void UpdateGoal(const Point3D& goal) {
         GoalReset();
         is_use_internav_goal = false;
+        // Reproject goal if inside obstacle polygon — ref: graph_planner.cpp:355 ReEvaluateGoalPosition
+        // Ref: contour_graph.cpp:546 ReprojectPointOutsidePolygons
+        Point3D adj_goal = goal;
+        ReprojectPointOutsidePolygons(adj_goal, G.kNearDist);
         // Check if near an existing internav node
         float min_dist = G.kNearDist;
         for (const auto& n : current_graph) {
             if (n->is_navpoint) {
-                float d = (n->position - goal).norm();
+                float d = (n->position - adj_goal).norm();
                 if (d < min_dist) {
                     is_use_internav_goal = true;
                     goal_node = n;
@@ -1025,7 +1118,7 @@ struct GraphPlanner {
             }
         }
         if (!is_use_internav_goal) {
-            CreateNavNodeFromPoint(goal, goal_node, false, false, true);
+            CreateNavNodeFromPoint(adj_goal, goal_node, false, false, true);
             AddNodeToGraph(goal_node);
         }
         is_goal_init = true;
@@ -1033,7 +1126,7 @@ struct GraphPlanner {
         origin_goal_pos = goal_node->position;
         path_momentum_counter = 0;
         recorded_path.clear();
-        printf("[FAR] New goal set at (%.2f, %.2f, %.2f)\n", goal.x, goal.y, goal.z);
+        printf("[FAR] New goal set at (%.2f, %.2f, %.2f)\n", adj_goal.x, adj_goal.y, adj_goal.z);
     }
 
     bool PathToGoal(const NavNodePtr& goal_ptr, NodePtrStack& global_path,
@@ -1044,8 +1137,10 @@ struct GraphPlanner {
         global_path.clear();
         goal_p = goal_ptr->position;
 
-        if ((odom_node->position - goal_p).norm() < converge_dist ||
-            (odom_node->position - origin_goal_pos).norm() < converge_dist) {
+        // Use 2D (flat) distance for goal convergence — goal z may differ from robot z
+        // (e.g. clicked_point has z=0 but robot is at z=1.24)
+        if ((odom_node->position - goal_p).norm_flat() < converge_dist ||
+            (odom_node->position - origin_goal_pos).norm_flat() < converge_dist) {
             is_succeed = true;
             global_path.push_back(odom_node);
             global_path.push_back(goal_ptr);
@@ -1059,10 +1154,32 @@ struct GraphPlanner {
         if (goal_ptr->parent) {
             NodePtrStack path;
             if (ReconstructPath(goal_ptr, path)) {
-                nav_wp = NextWaypoint(path, goal_ptr);
+                NavNodePtr new_wp = NextWaypoint(path, goal_ptr);
+                // Momentum: if new waypoint direction is inconsistent with previous
+                // (heading dot product < 0), use recorded path for up to momentum_thred cycles.
+                // Ref: graph_planner.cpp:198-223 momentum navigation
+                if (is_global_path_init && path_momentum_counter < momentum_thred && !recorded_path.empty()) {
+                    // Compare heading: prev_wp → odom vs odom → new_wp
+                    NavNodePtr prev_wp = (recorded_path.size() >= 2) ? recorded_path[1] : nullptr;
+                    if (prev_wp && new_wp != prev_wp) {
+                        Point3D old_dir = odom_node->position - prev_wp->position;
+                        Point3D new_dir = new_wp->position - odom_node->position;
+                        float dot = old_dir.x*new_dir.x + old_dir.y*new_dir.y;
+                        if (dot < 0.0f) {
+                            // Heading reversal — use momentum path
+                            global_path = recorded_path;
+                            nav_wp = NextWaypoint(recorded_path, goal_ptr);
+                            path_momentum_counter++;
+                            return true;
+                        }
+                    }
+                }
+                // Accept new path
+                nav_wp = new_wp;
                 global_path = path;
                 recorded_path = path;
                 is_global_path_init = true;
+                path_momentum_counter = 0;
                 return true;
             }
         }
@@ -2425,7 +2542,7 @@ int main(int argc, char** argv) {
             static int dbg_ctr = 0;
             if (++dbg_ctr % 10 == 0) {
                 auto gp_tmp = planner.goal_node;
-                float goal_dist = gp_tmp ? (robot_p - Point3D(gp_tmp->position.x, gp_tmp->position.y, gp_tmp->position.z)).norm() : 0.0f;
+                float goal_dist = gp_tmp ? (robot_p - Point3D(gp_tmp->position.x, gp_tmp->position.y, gp_tmp->position.z)).norm_flat() : 0.0f;
                 printf("[FAR] status: odom=%d cloud=%d graph_init=%d "
                        "graph_nodes=%zu  robot=(%.2f,%.2f)  "
                        "has_goal=%d  goal=(%.2f,%.2f)  goal_dist=%.1fm  "
@@ -2435,6 +2552,21 @@ int main(int argc, char** argv) {
                        robot_p.x, robot_p.y,
                        (gp_tmp != nullptr), goal_p.x, goal_p.y, goal_dist,
                        obs_snap.size());
+                fflush(stdout);
+            }
+            // Dump graph summary every 100 cycles (~20s)
+            static int dump_ctr = 0;
+            if (++dump_ctr % 100 == 0) {
+                int odom_count=0, nav_count=0, contour_count=0, goal_count=0;
+                for (const auto& n : g_global_graph_nodes) {
+                    if (n->is_odom) odom_count++;
+                    if (n->is_navpoint) nav_count++;
+                    if (n->is_contour_match) contour_count++;
+                    if (n->is_goal) goal_count++;
+                }
+                printf("[FAR] graph: total=%zu odom=%d nav=%d contour=%d goal=%d polys=%zu\n",
+                       g_global_graph_nodes.size(), odom_count, nav_count, contour_count, goal_count,
+                       g_contour_polygons.size());
                 fflush(stdout);
             }
         }
@@ -2623,7 +2755,7 @@ int main(int argc, char** argv) {
                 wp_msg.point.z = odom_node->position.z;
                 lcm.publish(topic_wp, &wp_msg);
 
-                float dist_to_goal = (odom_node->position - cur_goal).norm();
+                float dist_to_goal = (odom_node->position - cur_goal).norm_flat();
                 if (verbose) {
                     printf("[FAR] GRAPH PATH → wp=(%.2f,%.2f,%.2f)  "
                            "path_nodes=%zu  graph_nodes=%zu  robot=(%.2f,%.2f)  "
@@ -2664,7 +2796,7 @@ int main(int argc, char** argv) {
                        cur_goal.x, cur_goal.y, cur_goal.z,
                        odom_node->position.x, odom_node->position.y,
                        nav_graph.size(), traversable_count, goal_connected,
-                       (odom_node->position - cur_goal).norm());
+                       (odom_node->position - cur_goal).norm_flat());
                 fflush(stdout);
             }
 
