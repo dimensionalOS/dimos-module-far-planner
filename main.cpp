@@ -470,6 +470,7 @@ struct FARGlobals {
             if (p.intensity < kNewPIThred) out->points.push_back(p);
         }
     }
+    // Ref: utility.cpp:205-226  FARUtil::ExtractFreeAndObsCloud
     void ExtractFreeAndObsCloud(const PointCloudPtr& in, const PointCloudPtr& free_out, const PointCloudPtr& obs_out) {
         free_out->clear(); obs_out->clear();
         for (const auto& p : in->points) {
@@ -731,6 +732,10 @@ static std::vector<PointPair> g_local_boundary;
 static std::vector<PointPair> g_inactive_contour;
 static std::vector<PointPair> g_unmatched_contour;
 static std::unordered_set<NavEdge, navedge_hash> g_global_contour_set;
+
+// Ray-cast obstacle check callback — set in main() after MapHandler is created.
+// Returns true if the line from p1 to p2 is blocked by accumulated obstacles.
+static std::function<bool(const Point3D&, const Point3D&)> g_obstacle_raycast = nullptr;
 static std::unordered_set<NavEdge, navedge_hash> g_boundary_contour_set;
 
 // ---------------------------------------------------------------------------
@@ -852,15 +857,33 @@ static bool IsEdgeCollidePoly(const PointStack& poly, const ConnectPair& edge) {
     }
     return false;
 }
+// Ref: contour_graph.cpp:94-112  IsNavNodesConnectFreePolygon
+// Ref: contour_graph.cpp:156-208  IsPointsConnectFreePolygon
 static bool IsNavNodesConnectFreePolygon(const NavNodePtr& n1, const NavNodePtr& n2) {
-    // simplified check against boundary contours
     ConnectPair cedge(n1->position, n2->position);
-    HeightPair hp(n1->position, n2->position);
+    // Check boundary contour segments (from boundary handler — empty without it)
     for (const auto& c : g_boundary_contour) {
         if (IsEdgeCollideSegment(c, cedge)) return false;
     }
+    // Check global contour segments for edges where at least one endpoint
+    // is outside local range (same as reference: global_contour_ is only
+    // checked when is_global_check=true).
+    // Ref: contour_graph.cpp:193-206  global check branch
+    bool is_global = !G.IsPointInLocalRange(n1->position) ||
+                     !G.IsPointInLocalRange(n2->position);
+    if (is_global) {
+        for (const auto& c : g_global_contour) {
+            if (IsEdgeCollideSegment(c, cedge)) return false;
+        }
+    }
+    // Skip collision check against a node's own source polygon —
+    // contour-derived nodes sit just outside their polygon, so the
+    // edge to/from them would always graze it.
+    auto skip1 = n1->ctnode ? n1->ctnode->poly_ptr : nullptr;
+    auto skip2 = n2->ctnode ? n2->ctnode->poly_ptr : nullptr;
     for (const auto& poly : g_contour_polygons) {
         if (poly->is_pillar) continue;
+        if (poly == skip1 || poly == skip2) continue;
         if (IsEdgeCollidePoly(poly->vertices, cedge)) return false;
     }
     return true;
@@ -872,7 +895,8 @@ static bool IsNavNodesConnectFreePolygon(const NavNodePtr&, const NavNodePtr&) {
 
 // ---------------------------------------------------------------------------
 //  Dijkstra-based traversability + A* path planning
-//  (Port of graph_planner.cpp)
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/src/graph_planner.cpp
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/include/far_planner/graph_planner.h
 // ---------------------------------------------------------------------------
 struct GraphPlanner {
     NavNodePtr odom_node = nullptr;
@@ -891,6 +915,7 @@ struct GraphPlanner {
     void UpdateGraphTraverability(const NavNodePtr& odom, const NavNodePtr& goal_ptr) {
         if (!odom || current_graph.empty()) return;
         odom_node = odom;
+        // Debug: verify goal is in graph
         // Init all node states
         for (auto& n : current_graph) {
             n->gscore = G.kINF; n->fgscore = G.kINF;
@@ -941,7 +966,17 @@ struct GraphPlanner {
         if (!goal_ptr || is_use_internav_goal) return;
         for (const auto& n : current_graph) {
             if (n == goal_ptr) continue;
-            if (n->is_traversable && IsNavNodesConnectFreePolygon(n, goal_ptr)) {
+            // Connect goal to any visible node (not just traversable ones).
+            // Traversability is determined by Dijkstra from odom — limiting
+            // goal edges to traversable nodes creates a circular dependency
+            // when the odom-to-graph connectivity is sparse.
+            bool poly_free = IsNavNodesConnectFreePolygon(n, goal_ptr);
+            // Ray-cast sanity check against accumulated obstacle cloud.
+            if (poly_free && g_obstacle_raycast) {
+                if (g_obstacle_raycast(n->position, goal_ptr->position))
+                    poly_free = false;
+            }
+            if (poly_free) {
                 AddPolyEdge(n, goal_ptr); AddEdge(n, goal_ptr);
                 n->is_block_to_goal = false;
             } else {
@@ -1061,7 +1096,8 @@ struct GraphPlanner {
 
 // ---------------------------------------------------------------------------
 //  Dynamic graph manager — simplified
-//  (Core of dynamic_graph.h / dynamic_graph.cpp)
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/src/dynamic_graph.cpp
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/include/far_planner/dynamic_graph.h
 // ---------------------------------------------------------------------------
 struct DynamicGraphManager {
     NavNodePtr odom_node = nullptr;
@@ -1103,6 +1139,49 @@ struct DynamicGraphManager {
         }
     }
 
+    // Remove stale contour-match nodes that haven't been re-observed.
+    // Called after ExtractGraphNodes so that matched nodes have had
+    // their clear_dumper_count reset.
+    void CleanupStaleNodes() {
+        NodePtrStack keep;
+        keep.reserve(g_global_graph_nodes.size());
+        for (auto& n : g_global_graph_nodes) {
+            if (n->is_odom || n->is_navpoint || n->is_goal || n->is_finalized) {
+                keep.push_back(n);
+                continue;
+            }
+            // Contour-match nodes in local range that weren't re-matched
+            // get their dumper count incremented.
+            if (n->is_contour_match && n->is_wide_near) {
+                n->clear_dumper_count++;
+            }
+            if (n->clear_dumper_count > dumper_thred) {
+                // Remove all edges to/from this node
+                for (auto& other : n->connect_nodes) {
+                    other->connect_nodes.erase(
+                        std::remove(other->connect_nodes.begin(), other->connect_nodes.end(), n),
+                        other->connect_nodes.end());
+                    other->poly_connects.erase(
+                        std::remove(other->poly_connects.begin(), other->poly_connects.end(), n),
+                        other->poly_connects.end());
+                }
+                n->connect_nodes.clear();
+                n->poly_connects.clear();
+                // Don't add to keep — node is removed
+            } else {
+                keep.push_back(n);
+            }
+        }
+        if (keep.size() != g_global_graph_nodes.size()) {
+            g_global_graph_nodes = std::move(keep);
+            // Rebuild index map
+            g_idx_node_map.clear();
+            for (auto& n : g_global_graph_nodes) {
+                g_idx_node_map[n->id] = n;
+            }
+        }
+    }
+
     bool ExtractGraphNodes() {
         new_nodes.clear();
         // Check if we need a trajectory waypoint
@@ -1115,6 +1194,117 @@ struct DynamicGraphManager {
             last_internav = cur_internav;
             cur_internav = np;
         }
+
+        // Promote contour vertices to nav graph nodes, or update existing
+        // nodes that match.  The original does this via MatchContourWithNavGraph
+        // with RANSAC position filtering.  This simplified version either:
+        //   - updates an existing contour-match node's position (running average)
+        //   - creates a new nav node if no match exists
+        for (const auto& ct : g_contour_graph) {
+            if (ct->free_direct == PILLAR) continue;
+
+            // Only process vertices within sensor range
+            if ((ct->position - G.robot_pos).norm_flat() > G.kSensorRange) continue;
+
+            // Compute offset position in free space
+            Point3D offset_dir;
+            if (ct->surf_dirs.first.z > -0.5f && ct->surf_dirs.second.z > -0.5f) {
+                offset_dir = (ct->surf_dirs.first + ct->surf_dirs.second);
+                float len = offset_dir.norm_flat();
+                if (len > EPSILON_VAL) {
+                    offset_dir = offset_dir * (1.0f / len);
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            Point3D nav_pos = ct->position + offset_dir * G.kNavClearDist;
+
+            // Try to match with an existing contour-derived node
+            NavNodePtr matched = nullptr;
+            float best_dist = G.kMatchDist;
+            for (const auto& existing : g_global_graph_nodes) {
+                if (!existing->is_contour_match) continue;
+                float d = (existing->position - nav_pos).norm_flat();
+                if (d < best_dist) {
+                    best_dist = d;
+                    matched = existing;
+                }
+            }
+
+            if (matched) {
+                // Update existing node with running average (simple position filter)
+                float alpha = 0.3f;
+                matched->position.x = matched->position.x * (1-alpha) + nav_pos.x * alpha;
+                matched->position.y = matched->position.y * (1-alpha) + nav_pos.y * alpha;
+                matched->surf_dirs = ct->surf_dirs;
+                matched->free_direct = ct->free_direct;
+                matched->ctnode = ct;
+                ct->is_global_match = true;  // mark CTNode as matched
+                matched->is_active = true;
+                matched->is_covered = true;  // re-observed → mark covered for Dijkstra
+                matched->is_boundary = false;  // boundary flag is for boundary handler module
+                matched->clear_dumper_count = 0;  // reset stale counter
+            } else {
+                // Also check against new nodes added this cycle
+                bool too_close = false;
+                for (const auto& nn : new_nodes) {
+                    if ((nn->position - nav_pos).norm_flat() < G.kMatchDist) {
+                        too_close = true;
+                        break;
+                    }
+                }
+                if (too_close) continue;
+
+                NavNodePtr np;
+                CreateNavNodeFromPoint(nav_pos, np, false, false);
+                np->surf_dirs = ct->surf_dirs;
+                np->free_direct = ct->free_direct;
+                np->is_contour_match = true;
+                np->is_covered = true;  // visible → eligible for Dijkstra expansion
+                np->is_boundary = false;  // boundary flag is for boundary handler module
+                np->ctnode = ct;
+                ct->is_global_match = true;  // mark CTNode as matched
+                new_nodes.push_back(np);
+            }
+        }
+        // Establish contour connections between adjacent matched nav nodes
+        // on the same polygon. This populates g_boundary_contour_set via
+        // AddContourConnect → AddContourToSets, giving the collision check
+        // line-segment barriers that block paths through wall gaps.
+        // Ref: dynamic_graph.cpp:237-238 RecordContourVote
+        // Ref: dynamic_graph.cpp:551 AddContourConnect
+        // Ref: contour_graph.cpp:218-254 IsCTNodesConnectFromContour
+        for (const auto& n1 : g_global_graph_nodes) {
+            if (!n1->is_contour_match || !n1->ctnode) continue;
+            for (const auto& n2 : g_global_graph_nodes) {
+                if (n2 == n1 || !n2->is_contour_match || !n2->ctnode) continue;
+                if (n1->ctnode->poly_ptr != n2->ctnode->poly_ptr) continue;
+                if (G.IsTypeInStack(n2, n1->contour_connects)) continue;
+                // Walk front from n1→ctnode to see if we reach n2→ctnode
+                // without crossing another matched ctnode (adjacency check)
+                bool adjacent = false;
+                CTNodePtr cur = n1->ctnode->front;
+                while (cur && cur != n1->ctnode) {
+                    if (cur == n2->ctnode) { adjacent = true; break; }
+                    if (cur->is_global_match) break;
+                    cur = cur->front;
+                }
+                if (!adjacent) {
+                    cur = n1->ctnode->back;
+                    while (cur && cur != n1->ctnode) {
+                        if (cur == n2->ctnode) { adjacent = true; break; }
+                        if (cur->is_global_match) break;
+                        cur = cur->back;
+                    }
+                }
+                if (adjacent) {
+                    AddContourConnect(n1, n2);
+                }
+            }
+        }
+
         return !new_nodes.empty();
     }
 
@@ -1124,12 +1314,19 @@ struct DynamicGraphManager {
         for (const auto& nn : new_nodes_in) {
             AddNodeToGraph(nn);
             nn->is_near_nodes = true;
+            nn->is_wide_near = true;
             near_nav_nodes.push_back(nn);
+            wide_near_nodes.push_back(nn);
         }
         // Build visibility edges between odom and near nodes
         for (const auto& n : wide_near_nodes) {
             if (n->is_odom) continue;
-            if (IsNavNodesConnectFreePolygon(odom_node, n)) {
+            bool poly_free = IsNavNodesConnectFreePolygon(odom_node, n);
+            if (poly_free && g_obstacle_raycast) {
+                if (g_obstacle_raycast(odom_node->position, n->position))
+                    poly_free = false;
+            }
+            if (poly_free) {
                 AddPolyEdge(odom_node, n); AddEdge(odom_node, n);
             } else {
                 ErasePolyEdge(odom_node, n); EraseEdge(odom_node, n);
@@ -1142,7 +1339,12 @@ struct DynamicGraphManager {
             for (std::size_t j=i+1; j<near_nav_nodes.size(); j++) {
                 auto n2 = near_nav_nodes[j];
                 if (n2->is_odom) continue;
-                if (IsNavNodesConnectFreePolygon(n1, n2)) {
+                bool n_poly_free = IsNavNodesConnectFreePolygon(n1, n2);
+                if (n_poly_free && g_obstacle_raycast) {
+                    if (g_obstacle_raycast(n1->position, n2->position))
+                        n_poly_free = false;
+                }
+                if (n_poly_free) {
                     AddPolyEdge(n1, n2); AddEdge(n1, n2);
                 } else {
                     ErasePolyEdge(n1, n2); EraseEdge(n1, n2);
@@ -1166,7 +1368,9 @@ struct DynamicGraphManager {
 
 // ---------------------------------------------------------------------------
 //  Contour detector — simplified OpenCV contour extraction
-//  (Port of contour_detector.cpp — only built with HAS_OPENCV)
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/src/contour_detector.cpp
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/include/far_planner/contour_detector.h
+//  (Only built with HAS_OPENCV)
 // ---------------------------------------------------------------------------
 #ifdef HAS_OPENCV
 struct ContourDetector {
@@ -1223,6 +1427,8 @@ struct ContourDetector {
             int r, c;
             PointToImgSub(p3, r, c, false);
             if (r>=0 && r<MAT_SIZE && c>=0 && c<MAT_SIZE) {
+                // Inflate each point by ±1 pixel (matching reference).
+                // Ref: contour_detector.cpp:44 inflate_vec{-1, 0, 1}
                 for (int dr=-1; dr<=1; dr++) for (int dc=-1; dc<=1; dc++) {
                     int rr=r+dr, cc=c+dc;
                     if (rr>=0&&rr<MAT_SIZE&&cc>=0&&cc<MAT_SIZE) img_mat.at<float>(rr,cc)+=1.0f;
@@ -1261,7 +1467,8 @@ struct ContourDetector {
 
 // ---------------------------------------------------------------------------
 //  Contour graph manager — simplified
-//  (Port of contour_graph.cpp)
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/src/contour_graph.cpp
+//  Ref: ros-navigation-autonomy-stack/src/route_planner/far_planner/include/far_planner/contour_graph.h
 // ---------------------------------------------------------------------------
 struct ContourGraphManager {
     NavNodePtr odom_node = nullptr;
@@ -1386,6 +1593,579 @@ struct ContourGraphManager {
 };
 
 // ---------------------------------------------------------------------------
+//  MapHandler — persistent 3D world grid for obstacle/free-space accumulation
+//  Port of:
+//    ros-navigation-autonomy-stack/src/route_planner/far_planner/include/far_planner/map_handler.h
+//    ros-navigation-autonomy-stack/src/route_planner/far_planner/src/map_handler.cpp
+//  Grid utility:
+//    ros-navigation-autonomy-stack/src/route_planner/far_planner/include/far_planner/grid.h
+//
+//  Accumulates obstacle and free-space points across frames so the contour
+//  detector receives dense, properly-closed wall polygons.
+// ---------------------------------------------------------------------------
+#ifdef USE_PCL
+struct MapHandler {
+    // Configuration (set before Init)
+    float sensor_range_ = 15.0f;
+    float floor_height_ = 1.5f;
+    float cell_length_ = 1.5f;
+    float cell_height_ = 0.6f;
+    float grid_max_length_ = 300.0f;
+    float grid_max_height_ = 3.0f;
+    float height_voxel_dim_ = 0.2f;
+
+    // Grids
+    std::unique_ptr<grid_ns::Grid<PointCloudPtr>> world_obs_cloud_grid_;
+    std::unique_ptr<grid_ns::Grid<PointCloudPtr>> world_free_cloud_grid_;
+    std::unique_ptr<grid_ns::Grid<std::vector<float>>> terrain_height_grid_;
+
+    // Neighbor cell indices (recomputed each frame around robot)
+    std::unordered_set<int> neighbor_obs_indices_;
+    std::unordered_set<int> neighbor_free_indices_;
+    std::unordered_set<int> extend_obs_indices_;
+
+    // State
+    Eigen::Vector3i robot_cell_sub_;
+    int neighbor_Lnum_ = 0;
+    int neighbor_Hnum_ = 5;
+    int INFLATE_N = 1;
+    bool is_init_ = false;
+
+    // Terrain KdTree (flat cloud with height stored in intensity)
+    PointCloudPtr flat_terrain_cloud_;
+    PointKdTreePtr kdtree_terrain_cloud_;
+
+    // Per-cell tracking lists
+    std::vector<int> global_visited_indices_;
+    std::vector<int> util_obs_modified_list_;
+    std::vector<int> util_free_modified_list_;
+    std::vector<int> terrain_grid_occupy_list_;
+    std::vector<int> terrain_grid_traverse_list_;
+
+    // Ref: map_handler.cpp:13-65  MapHandler::Init
+    void Init() {
+        const int row_num = static_cast<int>(std::ceil(grid_max_length_ / cell_length_));
+        const int col_num = row_num;
+        int level_num = static_cast<int>(std::ceil(grid_max_height_ / cell_height_));
+        neighbor_Lnum_ = static_cast<int>(std::ceil(sensor_range_ * 2.0f / cell_length_)) + 1;
+        if (level_num % 2 == 0) level_num++;
+        if (neighbor_Lnum_ % 2 == 0) neighbor_Lnum_++;
+
+        Eigen::Vector3i pc_size(row_num, col_num, level_num);
+        Eigen::Vector3d pc_origin(0, 0, 0);
+        Eigen::Vector3d pc_res(cell_length_, cell_length_, cell_height_);
+        PointCloudPtr null_cloud;
+        world_obs_cloud_grid_ = std::make_unique<grid_ns::Grid<PointCloudPtr>>(
+            pc_size, null_cloud, pc_origin, pc_res, 3);
+        world_free_cloud_grid_ = std::make_unique<grid_ns::Grid<PointCloudPtr>>(
+            pc_size, null_cloud, pc_origin, pc_res, 3);
+
+        const int n_cell = world_obs_cloud_grid_->GetCellNumber();
+        for (int i = 0; i < n_cell; i++) {
+            world_obs_cloud_grid_->GetCell(i) = PointCloudPtr(new PointCloud);
+            world_free_cloud_grid_->GetCell(i) = PointCloudPtr(new PointCloud);
+        }
+        global_visited_indices_.assign(n_cell, 0);
+        util_obs_modified_list_.assign(n_cell, 0);
+        util_free_modified_list_.assign(n_cell, 0);
+
+        // Terrain height grid: 2D grid (z-dim=1) at robot_dim resolution
+        int height_dim = static_cast<int>(
+            std::ceil((sensor_range_ + cell_length_) * 2.0f / G.robot_dim));
+        if (height_dim % 2 == 0) height_dim++;
+        Eigen::Vector3i h_size(height_dim, height_dim, 1);
+        Eigen::Vector3d h_origin(0, 0, 0);
+        Eigen::Vector3d h_res(G.robot_dim, G.robot_dim, G.kLeafSize);
+        std::vector<float> empty_vec;
+        terrain_height_grid_ = std::make_unique<grid_ns::Grid<std::vector<float>>>(
+            h_size, empty_vec, h_origin, h_res, 3);
+
+        const int n_terrain = terrain_height_grid_->GetCellNumber();
+        terrain_grid_occupy_list_.assign(n_terrain, 0);
+        terrain_grid_traverse_list_.assign(n_terrain, 0);
+
+        flat_terrain_cloud_ = PointCloudPtr(new PointCloud());
+        kdtree_terrain_cloud_ = PointKdTreePtr(new pcl::KdTreeFLANN<PCLPoint>());
+        kdtree_terrain_cloud_->setSortedResults(false);
+
+        printf("[FAR] MapHandler: obs_grid=%dx%dx%d (%d cells)  "
+               "terrain_grid=%dx%d  cell=%.1fm  sensor=%.1fm\n",
+               row_num, col_num, level_num, n_cell,
+               height_dim, height_dim, cell_length_, sensor_range_);
+    }
+
+    // Ref: map_handler.cpp:129-140  MapHandler::SetMapOrigin
+    void SetMapOrigin(const Point3D& robot_pos) {
+        const Eigen::Vector3i dim = world_obs_cloud_grid_->GetSize();
+        float ox = robot_pos.x - (cell_length_ * dim.x()) / 2.0f;
+        float oy = robot_pos.y - (cell_length_ * dim.y()) / 2.0f;
+        float oz = robot_pos.z - (cell_height_ * dim.z()) / 2.0f - G.vehicle_height;
+        Eigen::Vector3d origin(ox, oy, oz);
+        world_obs_cloud_grid_->SetOrigin(origin);
+        world_free_cloud_grid_->SetOrigin(origin);
+        is_init_ = true;
+        printf("[FAR] MapHandler: grid origin set at (%.2f, %.2f, %.2f)\n", ox, oy, oz);
+    }
+
+    // Ref: map_handler.cpp:172-181  MapHandler::SetTerrainHeightGridOrigin
+    void SetTerrainHeightGridOrigin(const Point3D& robot_pos) {
+        const Eigen::Vector3d res = terrain_height_grid_->GetResolution();
+        const Eigen::Vector3i dim = terrain_height_grid_->GetSize();
+        Eigen::Vector3d origin;
+        origin.x() = robot_pos.x - (res.x() * dim.x()) / 2.0f;
+        origin.y() = robot_pos.y - (res.y() * dim.y()) / 2.0f;
+        origin.z() = 0.0f - (res.z() * dim.z()) / 2.0f;
+        terrain_height_grid_->SetOrigin(origin);
+    }
+
+    // Ref: map_handler.cpp:142-170  MapHandler::UpdateRobotPosition
+    void UpdateRobotPosition(const Point3D& odom_pos) {
+        if (!is_init_) SetMapOrigin(odom_pos);
+        robot_cell_sub_ = world_obs_cloud_grid_->Pos2Sub(
+            Eigen::Vector3d(odom_pos.x, odom_pos.y, odom_pos.z));
+        neighbor_free_indices_.clear();
+        neighbor_obs_indices_.clear();
+        const int N = neighbor_Lnum_ / 2;
+        const int H = neighbor_Hnum_ / 2;
+        Eigen::Vector3i nsub;
+        for (int i = -N; i <= N; i++) {
+            nsub.x() = robot_cell_sub_.x() + i;
+            for (int j = -N; j <= N; j++) {
+                nsub.y() = robot_cell_sub_.y() + j;
+                // Extra layer below for terrain free points
+                nsub.z() = robot_cell_sub_.z() - H - 1;
+                if (world_obs_cloud_grid_->InRange(nsub)) {
+                    neighbor_free_indices_.insert(world_obs_cloud_grid_->Sub2Ind(nsub));
+                }
+                for (int k = -H; k <= H; k++) {
+                    nsub.z() = robot_cell_sub_.z() + k;
+                    if (world_obs_cloud_grid_->InRange(nsub)) {
+                        int ind = world_obs_cloud_grid_->Sub2Ind(nsub);
+                        neighbor_obs_indices_.insert(ind);
+                        neighbor_free_indices_.insert(ind);
+                    }
+                }
+            }
+        }
+        SetTerrainHeightGridOrigin(odom_pos);
+    }
+
+    // Ref: map_handler.cpp:201-221  MapHandler::UpdateObsCloudGrid
+    void UpdateObsCloudGrid(const PointCloudPtr& obsCloud) {
+        if (!is_init_ || obsCloud->empty()) return;
+        std::fill(util_obs_modified_list_.begin(), util_obs_modified_list_.end(), 0);
+        for (const auto& point : obsCloud->points) {
+            Eigen::Vector3i sub = world_obs_cloud_grid_->Pos2Sub(
+                Eigen::Vector3d(point.x, point.y, point.z));
+            if (!world_obs_cloud_grid_->InRange(sub)) continue;
+            const int ind = world_obs_cloud_grid_->Sub2Ind(sub);
+            if (neighbor_obs_indices_.count(ind)) {
+                world_obs_cloud_grid_->GetCell(ind)->points.push_back(point);
+                util_obs_modified_list_[ind] = 1;
+                global_visited_indices_[ind] = 1;
+            }
+        }
+        // Voxel-filter modified cells to prevent unbounded growth
+        for (int i = 0; i < world_obs_cloud_grid_->GetCellNumber(); ++i) {
+            if (util_obs_modified_list_[i] == 1)
+                G.FilterCloud(world_obs_cloud_grid_->GetCell(i), G.kLeafSize);
+        }
+    }
+
+    // Ref: map_handler.cpp:223-238  MapHandler::UpdateFreeCloudGrid
+    void UpdateFreeCloudGrid(const PointCloudPtr& freeCloud) {
+        if (!is_init_ || freeCloud->empty()) return;
+        std::fill(util_free_modified_list_.begin(), util_free_modified_list_.end(), 0);
+        for (const auto& point : freeCloud->points) {
+            Eigen::Vector3i sub = world_free_cloud_grid_->Pos2Sub(
+                Eigen::Vector3d(point.x, point.y, point.z));
+            if (!world_free_cloud_grid_->InRange(sub)) continue;
+            const int ind = world_free_cloud_grid_->Sub2Ind(sub);
+            world_free_cloud_grid_->GetCell(ind)->points.push_back(point);
+            util_free_modified_list_[ind] = 1;
+            global_visited_indices_[ind] = 1;
+        }
+        for (int i = 0; i < world_free_cloud_grid_->GetCellNumber(); ++i) {
+            if (util_free_modified_list_[i] == 1)
+                G.FilterCloud(world_free_cloud_grid_->GetCell(i), G.kLeafSize);
+        }
+    }
+
+    // Ref: map_handler.cpp:183-190  MapHandler::GetSurroundObsCloud
+    void GetSurroundObsCloud(const PointCloudPtr& out) {
+        if (!is_init_) return;
+        out->clear();
+        for (const auto& ind : neighbor_obs_indices_) {
+            if (world_obs_cloud_grid_->GetCell(ind)->empty()) continue;
+            *out += *(world_obs_cloud_grid_->GetCell(ind));
+        }
+    }
+
+    // Ref: map_handler.cpp:192-199  MapHandler::GetSurroundFreeCloud
+    void GetSurroundFreeCloud(const PointCloudPtr& out) {
+        if (!is_init_) return;
+        out->clear();
+        for (const auto& ind : neighbor_free_indices_) {
+            if (world_free_cloud_grid_->GetCell(ind)->empty()) continue;
+            *out += *(world_free_cloud_grid_->GetCell(ind));
+        }
+    }
+
+    // Ref: map_handler.h:56-77  MapHandler::NearestHeightOfRadius
+    template <typename Position>
+    float NearestHeightOfRadius(const Position& p, float radius,
+                                float& minH, float& maxH, bool& is_matched) {
+        std::vector<int> pIdxK;
+        std::vector<float> pdDistK;
+        PCLPoint pcl_p;
+        pcl_p.x = p.x; pcl_p.y = p.y; pcl_p.z = 0.0f; pcl_p.intensity = 0.0f;
+        minH = maxH = p.z;
+        is_matched = false;
+        if (kdtree_terrain_cloud_->getInputCloud() &&
+            !kdtree_terrain_cloud_->getInputCloud()->empty() &&
+            kdtree_terrain_cloud_->radiusSearch(pcl_p, radius, pIdxK, pdDistK) > 0) {
+            const auto& cloud = kdtree_terrain_cloud_->getInputCloud();
+            float avgH = cloud->points[pIdxK[0]].intensity;
+            minH = maxH = avgH;
+            for (std::size_t i = 1; i < pIdxK.size(); i++) {
+                float h = cloud->points[pIdxK[i]].intensity;
+                if (h < minH) minH = h;
+                if (h > maxH) maxH = h;
+                avgH += h;
+            }
+            avgH /= static_cast<float>(pIdxK.size());
+            is_matched = true;
+            return avgH;
+        }
+        return p.z;
+    }
+
+    // Ref: map_handler.cpp:240-256  MapHandler::TerrainHeightOfPoint
+    float TerrainHeightOfPoint(const Point3D& p, bool& is_matched) {
+        is_matched = false;
+        const Eigen::Vector3i sub = terrain_height_grid_->Pos2Sub(
+            Eigen::Vector3d(p.x, p.y, 0.0f));
+        if (terrain_height_grid_->InRange(sub)) {
+            const int ind = terrain_height_grid_->Sub2Ind(sub);
+            if (terrain_grid_traverse_list_[ind] != 0) {
+                is_matched = true;
+                return terrain_height_grid_->GetCell(ind)[0];
+            }
+        }
+        return p.z;
+    }
+
+    void Expansion2D(const Eigen::Vector3i& csub,
+                     std::vector<Eigen::Vector3i>& subs, int n) {
+        subs.clear();
+        for (int ix = -n; ix <= n; ix++) {
+            for (int iy = -n; iy <= n; iy++) {
+                Eigen::Vector3i sub = csub;
+                sub.x() += ix;
+                sub.y() += iy;
+                subs.push_back(sub);
+            }
+        }
+    }
+
+    void AssignFlatTerrainCloud(const PointCloudPtr& ref, PointCloudPtr& flatOut) {
+        const int N = static_cast<int>(ref->size());
+        flatOut->resize(N);
+        for (int i = 0; i < N; i++) {
+            PCLPoint p = ref->points[i];
+            p.intensity = p.z;  // store height in intensity
+            p.z = 0.0f;        // flatten for 2D KdTree search
+            flatOut->points[i] = p;
+        }
+    }
+
+    // Ref: map_handler.cpp:391-422  MapHandler::UpdateTerrainHeightGrid
+    void UpdateTerrainHeightGrid(const PointCloudPtr& freeCloud,
+                                 const PointCloudPtr& heightOut) {
+        if (freeCloud->empty()) return;
+        // Voxel-filter free cloud at terrain grid resolution
+        PointCloudPtr filtered(new PointCloud());
+        pcl::copyPointCloud(*freeCloud, *filtered);
+        {
+            pcl::VoxelGrid<PCLPoint> vg;
+            vg.setInputCloud(filtered);
+            Eigen::Vector3d res = terrain_height_grid_->GetResolution();
+            vg.setLeafSize(static_cast<float>(res.x()),
+                           static_cast<float>(res.y()),
+                           static_cast<float>(res.z()));
+            PointCloud tmp;
+            vg.filter(tmp);
+            *filtered = tmp;
+        }
+        // Populate terrain height grid cells
+        std::fill(terrain_grid_occupy_list_.begin(), terrain_grid_occupy_list_.end(), 0);
+        for (const auto& point : filtered->points) {
+            Eigen::Vector3i csub = terrain_height_grid_->Pos2Sub(
+                Eigen::Vector3d(point.x, point.y, 0.0f));
+            std::vector<Eigen::Vector3i> subs;
+            Expansion2D(csub, subs, INFLATE_N);
+            for (const auto& sub : subs) {
+                if (!terrain_height_grid_->InRange(sub)) continue;
+                const int ind = terrain_height_grid_->Sub2Ind(sub);
+                if (terrain_grid_occupy_list_[ind] == 0) {
+                    terrain_height_grid_->GetCell(ind).resize(1);
+                    terrain_height_grid_->GetCell(ind)[0] = point.z;
+                } else {
+                    terrain_height_grid_->GetCell(ind).push_back(point.z);
+                }
+                terrain_grid_occupy_list_[ind] = 1;
+            }
+        }
+        // BFS traversable analysis from robot position
+        TraversableAnalysis(heightOut);
+        // Build flat terrain KdTree for height queries
+        if (heightOut->empty()) {
+            flat_terrain_cloud_->clear();
+        } else {
+            AssignFlatTerrainCloud(heightOut, flat_terrain_cloud_);
+            kdtree_terrain_cloud_->setInputCloud(flat_terrain_cloud_);
+        }
+        // Filter obs neighbor indices by terrain height — only when terrain
+        // data is dense enough to be reliable.  With sparse terrain (common
+        // during early exploration or in sim), skipping this avoids discarding
+        // valid obs cells that simply have no terrain height association.
+        const int MIN_TERRAIN_PTS = 200;
+        if (static_cast<int>(heightOut->size()) >= MIN_TERRAIN_PTS) {
+            ObsNeighborCloudWithTerrain();
+        }
+    }
+
+    // Ref: map_handler.cpp:424-504  MapHandler::TraversableAnalysis
+    void TraversableAnalysis(const PointCloudPtr& heightOut) {
+        const Eigen::Vector3i robot_sub = terrain_height_grid_->Pos2Sub(
+            Eigen::Vector3d(G.robot_pos.x, G.robot_pos.y, 0.0f));
+        heightOut->clear();
+        if (!terrain_height_grid_->InRange(robot_sub)) return;
+
+        const float H_THRED = height_voxel_dim_;
+        std::fill(terrain_grid_traverse_list_.begin(),
+                  terrain_grid_traverse_list_.end(), 0);
+
+        auto IsTraversableNeighbor = [&](int cur_id, int ref_id) -> bool {
+            if (terrain_grid_occupy_list_[ref_id] == 0) return false;
+            float cur_h = terrain_height_grid_->GetCell(cur_id)[0];
+            float ref_h = 0.0f;
+            int counter = 0;
+            for (const auto& e : terrain_height_grid_->GetCell(ref_id)) {
+                if (fabs(e - cur_h) > H_THRED) continue;
+                ref_h += e;
+                counter++;
+            }
+            if (counter > 0) {
+                terrain_height_grid_->GetCell(ref_id).resize(1);
+                terrain_height_grid_->GetCell(ref_id)[0] = ref_h / static_cast<float>(counter);
+                return true;
+            }
+            return false;
+        };
+
+        auto AddTraversePoint = [&](int idx) {
+            Eigen::Vector3d cpos = terrain_height_grid_->Ind2Pos(idx);
+            cpos.z() = terrain_height_grid_->GetCell(idx)[0];
+            PCLPoint p;
+            p.x = static_cast<float>(cpos.x());
+            p.y = static_cast<float>(cpos.y());
+            p.z = static_cast<float>(cpos.z());
+            p.intensity = 0.0f;
+            heightOut->points.push_back(p);
+            terrain_grid_traverse_list_[idx] = 1;
+        };
+
+        const int robot_idx = terrain_height_grid_->Sub2Ind(robot_sub);
+        const std::array<int, 4> dx = {-1, 0, 1, 0};
+        const std::array<int, 4> dy = { 0, 1, 0,-1};
+        std::deque<int> q;
+        bool robot_terrain_init = false;
+        std::unordered_set<int> visited;
+        q.push_back(robot_idx);
+        visited.insert(robot_idx);
+
+        while (!q.empty()) {
+            int cur_id = q.front();
+            q.pop_front();
+            if (terrain_grid_occupy_list_[cur_id] != 0) {
+                if (!robot_terrain_init) {
+                    // Initialize from robot's current height
+                    float avg_h = 0.0f;
+                    int counter = 0;
+                    for (const auto& e : terrain_height_grid_->GetCell(cur_id)) {
+                        if (fabs(e - G.robot_pos.z + G.vehicle_height) > H_THRED)
+                            continue;
+                        avg_h += e;
+                        counter++;
+                    }
+                    if (counter > 0) {
+                        avg_h /= static_cast<float>(counter);
+                        terrain_height_grid_->GetCell(cur_id).resize(1);
+                        terrain_height_grid_->GetCell(cur_id)[0] = avg_h;
+                        AddTraversePoint(cur_id);
+                        robot_terrain_init = true;
+                        q.clear();  // restart BFS from this cell
+                    }
+                } else {
+                    AddTraversePoint(cur_id);
+                }
+            } else if (robot_terrain_init) {
+                continue;  // skip unoccupied cells after init
+            }
+            const Eigen::Vector3i csub = terrain_height_grid_->Ind2Sub(cur_id);
+            for (int i = 0; i < 4; i++) {
+                Eigen::Vector3i ref_sub = csub;
+                ref_sub.x() += dx[i];
+                ref_sub.y() += dy[i];
+                if (!terrain_height_grid_->InRange(ref_sub)) continue;
+                int ref_id = terrain_height_grid_->Sub2Ind(ref_sub);
+                if (!visited.count(ref_id) &&
+                    (!robot_terrain_init ||
+                     IsTraversableNeighbor(cur_id, ref_id))) {
+                    q.push_back(ref_id);
+                    visited.insert(ref_id);
+                }
+            }
+        }
+    }
+
+    // Ref: map_handler.cpp:362-389  MapHandler::ObsNeighborCloudWithTerrain
+    void ObsNeighborCloudWithTerrain() {
+        std::unordered_set<int> neighbor_copy = neighbor_obs_indices_;
+        neighbor_obs_indices_.clear();
+        const float R = cell_length_ * 0.7071f;  // sqrt(2)/2 * cell diagonal
+        for (const auto& idx : neighbor_copy) {
+            Point3D pos(world_obs_cloud_grid_->Ind2Pos(idx));
+            bool inRange = false;
+            float minH, maxH;
+            NearestHeightOfRadius(pos, R, minH, maxH, inRange);
+            if (inRange &&
+                pos.z + cell_height_ > minH &&
+                pos.z - cell_height_ < maxH + G.kTolerZ) {
+                neighbor_obs_indices_.insert(idx);
+            }
+        }
+        // Build extended obs indices (one layer below each obs cell)
+        extend_obs_indices_.clear();
+        const std::vector<int> inflate_vec{-1, 0};
+        for (const int& idx : neighbor_obs_indices_) {
+            const Eigen::Vector3i csub = world_obs_cloud_grid_->Ind2Sub(idx);
+            for (const int& plus : inflate_vec) {
+                Eigen::Vector3i sub = csub;
+                sub.z() += plus;
+                if (!world_obs_cloud_grid_->InRange(sub)) continue;
+                extend_obs_indices_.insert(world_obs_cloud_grid_->Sub2Ind(sub));
+            }
+        }
+    }
+
+    // Ref: map_handler.cpp:344-360  MapHandler::AdjustCTNodeHeight
+    void AdjustCTNodeHeight(const CTNodeStack& ctnodes) {
+        if (ctnodes.empty()) return;
+        const float H_MAX = G.robot_pos.z + G.kTolerZ;
+        const float H_MIN = G.robot_pos.z - G.kTolerZ;
+        for (auto& ct : ctnodes) {
+            float min_th, max_th;
+            NearestHeightOfRadius(ct->position, G.kMatchDist,
+                                  min_th, max_th, ct->is_ground_associate);
+            if (ct->is_ground_associate) {
+                ct->position.z = min_th + G.vehicle_height;
+            } else {
+                ct->position.z = TerrainHeightOfPoint(
+                    ct->position, ct->is_ground_associate);
+                ct->position.z += G.vehicle_height;
+            }
+            ct->position.z = std::max(std::min(ct->position.z, H_MAX), H_MIN);
+        }
+    }
+
+    // Ref: map_handler.cpp:324-342  MapHandler::AdjustNodesHeight
+    void AdjustNodesHeight(const NodePtrStack& nodes) {
+        if (nodes.empty()) return;
+        for (const auto& n : nodes) {
+            if (!n->is_active || n->is_boundary || G.IsFreeNavNode(n) ||
+                G.IsOutsideGoal(n) ||
+                !G.IsPointInLocalRange(n->position, true))
+                continue;
+            bool is_match = false;
+            float terrain_h = TerrainHeightOfPoint(n->position, is_match);
+            if (is_match) {
+                terrain_h += G.vehicle_height;
+                if (n->pos_filter_vec.empty()) {
+                    n->position.z = terrain_h;
+                } else {
+                    n->pos_filter_vec.back().z = terrain_h;
+                    n->position.z = G.AveragePoints(PointStack(
+                        n->pos_filter_vec.begin(),
+                        n->pos_filter_vec.end())).z;
+                }
+            }
+        }
+    }
+
+    // Ray-cast sanity check: test if a 2D line segment from p1 to p2 is
+    // blocked by accumulated obstacle points in the world grid.
+    // Walks along the segment in cell_length_ steps, collecting obstacle
+    // points within robot_dim/2 of the line. Returns true if blocked.
+    bool IsEdgeBlockedByObstacles(const Point3D& p1, const Point3D& p2,
+                                   float robot_dim, int min_blocked_pts = 3) const {
+        if (!is_init_ || !world_obs_cloud_grid_) return false;
+        float dx = p2.x - p1.x, dy = p2.y - p1.y;
+        float dist = std::sqrt(dx*dx + dy*dy);
+        if (dist < 0.01f) return false;
+
+        float half_dim = robot_dim * 0.5f;
+        // Direction unit vector
+        float ux = dx/dist, uy = dy/dist;
+        // Step size: half cell to ensure we check each cell
+        float step = cell_length_ * 0.5f;
+        int n_steps = std::max(2, (int)(dist / step));
+        int blocked_count = 0;
+
+        for (int s = 0; s <= n_steps; s++) {
+            float t = (float)s / (float)n_steps;
+            float px = p1.x + dx * t;
+            float py = p1.y + dy * t;
+            // Skip endpoints (within 1m of start/end) to avoid self-blocking
+            float d1 = std::sqrt((px-p1.x)*(px-p1.x)+(py-p1.y)*(py-p1.y));
+            float d2 = std::sqrt((px-p2.x)*(px-p2.x)+(py-p2.y)*(py-p2.y));
+            if (d1 < 0.5f || d2 < 0.5f) continue;
+
+            // Check the grid cell and neighbors for obstacle points near the line
+            Eigen::Vector3d pos(px, py, p1.z);
+            Eigen::Vector3i sub = world_obs_cloud_grid_->Pos2Sub(pos);
+            if (!world_obs_cloud_grid_->InRange(sub)) continue;
+
+            // Check 3x3 neighborhood of cells
+            for (int di=-1; di<=1; di++) {
+                for (int dj=-1; dj<=1; dj++) {
+                    Eigen::Vector3i nsub(sub.x()+di, sub.y()+dj, sub.z());
+                    if (!world_obs_cloud_grid_->InRange(nsub)) continue;
+                    int ind = world_obs_cloud_grid_->Sub2Ind(nsub);
+                    const auto& cell = world_obs_cloud_grid_->GetCell(ind);
+                    if (!cell || cell->empty()) continue;
+
+                    for (const auto& pt : cell->points) {
+                        // 2D distance from point to line segment
+                        float apx = pt.x - p1.x, apy = pt.y - p1.y;
+                        float proj = apx*ux + apy*uy;
+                        if (proj < 0.5f || proj > dist - 0.5f) continue;
+                        float perp = std::abs(apx*(-uy) + apy*ux);
+                        if (perp < half_dim) {
+                            blocked_count++;
+                            if (blocked_count >= min_blocked_pts) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+};
+#endif  // USE_PCL
+
+// ---------------------------------------------------------------------------
 //  Message state — latest received LCM messages
 // ---------------------------------------------------------------------------
 static std::mutex g_state_mutex;
@@ -1396,8 +2176,13 @@ static bool g_goal_received = false;
 static Point3D g_robot_pos;
 static Point3D g_goal_point;
 
-// Cached obstacle points for contour detection (from registered_scan)
+// Cached obstacle points for contour detection (from terrain_map_ext)
 static std::vector<smartnav::PointXYZI> g_obs_points;
+
+// Raw terrain cloud with intensity-encoded free/obs classification (from terrain_map)
+// This is the equivalent of /terrain_cloud in the reference — used by MapHandler.
+static std::vector<smartnav::PointXYZI> g_terrain_cloud;
+static bool g_terrain_cloud_init = false;
 
 // ---------------------------------------------------------------------------
 //  LCM message handlers
@@ -1418,12 +2203,32 @@ static void on_odometry(const lcm::ReceiveBuffer*, const std::string&,
     }
 }
 
-static void on_registered_scan(const lcm::ReceiveBuffer*, const std::string&,
+// terrain_map_ext: classified obstacle cloud from TerrainMapExt — primary input
+// for contour detection and visibility graph construction.
+static void on_terrain_map_ext(const lcm::ReceiveBuffer*, const std::string&,
                                const sensor_msgs::PointCloud2* msg) {
     auto pts = smartnav::parse_pointcloud2(*msg);
     std::lock_guard<std::mutex> lk(g_state_mutex);
     g_obs_points = std::move(pts);
     g_cloud_init = true;
+}
+
+// terrain_map: raw terrain cloud from TerrainAnalysis with intensity-encoded
+// free/obs classification — used by MapHandler for persistent grid accumulation.
+// Ref: far_planner.cpp:28  terrain_sub_ subscribes to /terrain_cloud
+// Ref: terrainAnalysis.cpp:865  intensity = disZ (elevation above ground)
+static void on_terrain_map(const lcm::ReceiveBuffer*, const std::string&,
+                           const sensor_msgs::PointCloud2* msg) {
+    auto pts = smartnav::parse_pointcloud2(*msg);
+    std::lock_guard<std::mutex> lk(g_state_mutex);
+    g_terrain_cloud = std::move(pts);
+    g_terrain_cloud_init = true;
+}
+
+// registered_scan: raw lidar scan — kept for future dynamic obstacle detection.
+static void on_registered_scan(const lcm::ReceiveBuffer*, const std::string&,
+                               const sensor_msgs::PointCloud2* msg) {
+    (void)msg; // unused in static env mode; reserved for dynamic obs
 }
 
 static void on_goal(const lcm::ReceiveBuffer*, const std::string&,
@@ -1445,24 +2250,30 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signal_handler);
     std::signal(SIGINT,  signal_handler);
 
+    // Line-buffer stdout so logs are visible in real-time through subprocess pipe
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+
     dimos::NativeModule mod(argc, argv);
 
     // --- Read configurable parameters from CLI args ---
     G.robot_dim        = mod.arg_float("robot_dim", 0.8f);
     G.vehicle_height   = mod.arg_float("vehicle_height", 0.75f);
-    G.kLeafSize        = mod.arg_float("voxel_dim", 0.2f);
-    G.kSensorRange     = mod.arg_float("sensor_range", 30.0f);
+    G.kLeafSize        = mod.arg_float("voxel_dim", 0.1f);
+    G.kSensorRange     = mod.arg_float("sensor_range", 15.0f);
     G.kTerrainRange    = mod.arg_float("terrain_range", 15.0f);
     G.kLocalPlanRange  = mod.arg_float("local_planner_range", 5.0f);
-    G.is_static_env    = mod.arg_bool("is_static_env", true);
+    G.is_static_env    = mod.arg_bool("is_static_env", false);
     G.is_debug         = mod.arg_bool("is_debug", false);
     G.is_multi_layer   = mod.arg_bool("is_multi_layer", false);
     float main_freq    = mod.arg_float("update_rate", 5.0f);
-    float converge_d   = mod.arg_float("converge_dist", 1.0f);
+    float converge_d   = mod.arg_float("converge_dist", 0.4f);
     int momentum_thr   = mod.arg_int("momentum_thred", 5);
 
     // Compute derived parameters (same as LoadROSParams)
-    float floor_height = mod.arg_float("floor_height", 2.0f);
+    float floor_height = mod.arg_float("floor_height", 1.5f);
+    G.kFreeZ           = mod.arg_float("terrain_free_Z", 0.15f);
+    float cell_length  = mod.arg_float("cell_length", 1.5f);
+    float grid_max_len = mod.arg_float("grid_max_length", 300.0f);
     G.kHeightVoxel     = G.kLeafSize * 2.0f;
     G.kNearDist        = G.robot_dim;
     G.kMatchDist       = G.robot_dim * 2.0f + G.kLeafSize;
@@ -1495,32 +2306,35 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::string topic_scan  = mod.topic("registered_scan");
-    std::string topic_odom  = mod.topic("odometry");
-    std::string topic_goal  = mod.topic("goal");
-    std::string topic_wp    = mod.topic("way_point");
+    std::string topic_terrain_ext = mod.topic("terrain_map_ext");
+    std::string topic_terrain     = mod.topic("terrain_map");
+    std::string topic_scan        = mod.topic("registered_scan");
+    std::string topic_odom        = mod.topic("odometry");
+    std::string topic_goal        = mod.topic("goal");
+    std::string topic_wp          = mod.topic("way_point");
 
     // LCM subscribe requires member-function + object pointer; wrap free fns
     // in a trivial handler struct.
     struct LcmHandler {
-        static void odom_cb(const lcm::ReceiveBuffer* b, const std::string& c,
-                            const nav_msgs::Odometry* m) { on_odometry(b, c, m); }
-        static void scan_cb(const lcm::ReceiveBuffer* b, const std::string& c,
-                            const sensor_msgs::PointCloud2* m) { on_registered_scan(b, c, m); }
-        static void goal_cb(const lcm::ReceiveBuffer* b, const std::string& c,
-                            const geometry_msgs::PointStamped* m) { on_goal(b, c, m); }
         void odom(const lcm::ReceiveBuffer* b, const std::string& c,
                   const nav_msgs::Odometry* m) { on_odometry(b, c, m); }
+        void terrain_ext(const lcm::ReceiveBuffer* b, const std::string& c,
+                         const sensor_msgs::PointCloud2* m) { on_terrain_map_ext(b, c, m); }
+        void terrain(const lcm::ReceiveBuffer* b, const std::string& c,
+                     const sensor_msgs::PointCloud2* m) { on_terrain_map(b, c, m); }
         void scan(const lcm::ReceiveBuffer* b, const std::string& c,
                   const sensor_msgs::PointCloud2* m) { on_registered_scan(b, c, m); }
         void goal(const lcm::ReceiveBuffer* b, const std::string& c,
                   const geometry_msgs::PointStamped* m) { on_goal(b, c, m); }
     } lcm_handler;
-    lcm.subscribe(topic_odom, &LcmHandler::odom, &lcm_handler);
-    lcm.subscribe(topic_scan, &LcmHandler::scan, &lcm_handler);
-    lcm.subscribe(topic_goal, &LcmHandler::goal, &lcm_handler);
+    lcm.subscribe(topic_odom,        &LcmHandler::odom,        &lcm_handler);
+    lcm.subscribe(topic_terrain_ext, &LcmHandler::terrain_ext, &lcm_handler);
+    lcm.subscribe(topic_terrain,     &LcmHandler::terrain,     &lcm_handler);
+    lcm.subscribe(topic_scan,        &LcmHandler::scan,        &lcm_handler);
+    lcm.subscribe(topic_goal,        &LcmHandler::goal,        &lcm_handler);
 
-    printf("[FAR] Subscribed: scan=%s  odom=%s  goal=%s\n",
+    printf("[FAR] Subscribed: terrain_ext=%s  terrain=%s  scan=%s  odom=%s  goal=%s\n",
+           topic_terrain_ext.c_str(), topic_terrain.c_str(),
            topic_scan.c_str(), topic_odom.c_str(), topic_goal.c_str());
     printf("[FAR] Publishing: way_point=%s\n", topic_wp.c_str());
 
@@ -1539,10 +2353,26 @@ int main(int argc, char** argv) {
     ContourDetector contour_det;
     contour_det.sensor_range = G.kSensorRange;
     contour_det.voxel_dim = G.kLeafSize;
-    contour_det.kRatio = mod.arg_float("resize_ratio", 5.0f);
+    contour_det.kRatio = mod.arg_float("resize_ratio", 3.0f);
     contour_det.kThredValue = mod.arg_int("filter_count_value", 5);
     contour_det.kBlurSize = (int)std::round(G.kNavClearDist / G.kLeafSize);
     contour_det.Init();
+#endif
+
+#ifdef USE_PCL
+    MapHandler map_handler;
+    map_handler.sensor_range_ = G.kSensorRange;
+    map_handler.floor_height_ = floor_height;
+    map_handler.cell_length_ = cell_length;
+    map_handler.cell_height_ = floor_height / 2.5f;
+    map_handler.grid_max_length_ = grid_max_len;
+    map_handler.grid_max_height_ = floor_height * 2.0f;
+    map_handler.height_voxel_dim_ = G.kLeafSize * 2.0f;
+    map_handler.Init();
+    // Set up the ray-cast obstacle check callback
+    g_obstacle_raycast = [&map_handler](const Point3D& p1, const Point3D& p2) -> bool {
+        return map_handler.IsEdgeBlockedByObstacles(p1, p2, G.robot_dim, 5);
+    };
 #endif
 
     bool is_graph_init = false;
@@ -1551,23 +2381,41 @@ int main(int argc, char** argv) {
     printf("[FAR] Entering main loop (period=%dms)...\n", loop_ms);
 
     // --- Main loop ---
+    // Drain LCM messages continuously, run planning at update_rate.
+    // Ref: far_planner.cpp uses ROS spin + timer callbacks at separate rates.
+    // Here we use a single thread: drain messages with short timeout, then
+    // check if enough time has elapsed for the next planning cycle.
+    auto last_plan_time = std::chrono::steady_clock::now();
+    const auto plan_period = std::chrono::milliseconds(loop_ms);
+    const int drain_timeout_ms = 10;  // short timeout to keep draining messages
+
     while (!g_shutdown.load()) {
-        // Handle pending LCM messages (non-blocking with timeout)
-        lcm.handleTimeout(loop_ms);
+        // Drain all pending LCM messages with short timeout
+        lcm.handleTimeout(drain_timeout_ms);
+
+        // Only run planning cycle at the configured update_rate
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_plan_time < plan_period) continue;
+        last_plan_time = now;
 
         // Check preconditions
-        bool odom_ok, cloud_ok, goal_pending;
+        bool odom_ok, cloud_ok, terrain_ok, goal_pending;
         Point3D robot_p, goal_p;
         std::vector<smartnav::PointXYZI> obs_snap;
+        std::vector<smartnav::PointXYZI> terrain_snap;
         {
             std::lock_guard<std::mutex> lk(g_state_mutex);
             odom_ok = g_odom_init;
             cloud_ok = g_cloud_init;
+            terrain_ok = g_terrain_cloud_init;
             goal_pending = g_goal_received;
             robot_p = g_robot_pos;
             goal_p = g_goal_point;
             if (cloud_ok) {
                 obs_snap = g_obs_points; // copy
+            }
+            if (terrain_ok) {
+                terrain_snap = g_terrain_cloud; // copy
             }
             if (goal_pending) g_goal_received = false;
         }
@@ -1604,14 +2452,103 @@ int main(int argc, char** argv) {
         // free_odom_p: for now, same as odom
         G.free_odom_p = odom_node->position;
 
-        // 2. Extract contours from obstacle cloud
+        // 1b. MapHandler: accumulate obs/free into persistent grid, get surround obs
+        //     Ref: far_planner.cpp:722-781  FARMaster::TerrainCallBack
+        //     - Uses terrain_map (raw terrain cloud with intensity-encoded
+        //       free/obs classification) same as reference /terrain_cloud
+        //     - Crops, splits by intensity, feeds into MapHandler grids
+        //     - Extracts accumulated surround obs for contour detection
+#ifdef USE_PCL
+        if (terrain_ok) {
+            // Convert terrain_map (raw terrain cloud) to PCL
+            PointCloudPtr terrain_pcl(new PointCloud());
+            terrain_pcl->points.reserve(terrain_snap.size());
+            for (const auto& pp : terrain_snap) {
+                PCLPoint p;
+                p.x = pp.x; p.y = pp.y; p.z = pp.z; p.intensity = pp.intensity;
+                terrain_pcl->points.push_back(p);
+            }
+            // Crop box around robot (terrain_range x terrain_range x kTolerZ)
+            // Same as reference: FARUtil::CropBoxCloud(temp_cloud_ptr_, robot_pos_, ...)
+            PointCloudPtr cropped(new PointCloud());
+            for (const auto& p : terrain_pcl->points) {
+                if (fabs(p.x - robot_p.x) < G.kTerrainRange &&
+                    fabs(p.y - robot_p.y) < G.kTerrainRange &&
+                    fabs(p.z - robot_p.z) < G.kTolerZ) {
+                    cropped->points.push_back(p);
+                }
+            }
+            // Split by intensity: free (< kFreeZ) vs obs (>= kFreeZ)
+            // Same as reference: FARUtil::ExtractFreeAndObsCloud(...)
+            PointCloudPtr free_cloud(new PointCloud());
+            PointCloudPtr obs_cloud(new PointCloud());
+            G.ExtractFreeAndObsCloud(cropped, free_cloud, obs_cloud);
+            if (verbose) {
+                static int mh_ctr = 0;
+                if (++mh_ctr % 10 == 0) {
+                    printf("[FAR] maphandler: terrain_raw=%zu cropped=%zu free=%zu obs=%zu kFreeZ=%.3f\n",
+                           terrain_snap.size(), cropped->size(),
+                           free_cloud->size(), obs_cloud->size(), G.kFreeZ);
+                    fflush(stdout);
+                }
+            }
+            // Feed into MapHandler persistent grids
+            // Same as reference: map_handler_.UpdateRobotPosition + grids
+            map_handler.UpdateRobotPosition(robot_p);
+            map_handler.UpdateObsCloudGrid(obs_cloud);
+            map_handler.UpdateFreeCloudGrid(free_cloud);
+            // Terrain height analysis from accumulated free cloud
+            // Same as reference: GetSurroundFreeCloud → UpdateTerrainHeightGrid
+            PointCloudPtr surround_free(new PointCloud());
+            PointCloudPtr terrain_height(new PointCloud());
+            map_handler.GetSurroundFreeCloud(surround_free);
+            map_handler.UpdateTerrainHeightGrid(surround_free, terrain_height);
+            // Get accumulated surround obs for contour detection
+            // Same as reference: map_handler_.GetSurroundObsCloud(surround_obs_cloud_)
+            PointCloudPtr surround_obs(new PointCloud());
+            map_handler.GetSurroundObsCloud(surround_obs);
+            if (verbose) {
+                static int mh2_ctr = 0;
+                if (++mh2_ctr % 10 == 0) {
+                    printf("[FAR] maphandler: surround_obs=%zu surround_free=%zu terrain_h=%zu\n",
+                           surround_obs->size(), surround_free->size(), terrain_height->size());
+                    fflush(stdout);
+                }
+            }
+            // Replace single-frame obs_snap with accumulated surround obs
+            obs_snap.clear();
+            obs_snap.reserve(surround_obs->size());
+            for (const auto& p : surround_obs->points) {
+                smartnav::PointXYZI pp;
+                pp.x = p.x; pp.y = p.y; pp.z = p.z; pp.intensity = p.intensity;
+                obs_snap.push_back(pp);
+            }
+        }
+#endif
+
+        // 2. Extract contours from obstacle cloud (now using accumulated surround obs)
         std::vector<PointStack> realworld_contours;
 #ifdef HAS_OPENCV
         contour_det.BuildAndExtract(odom_node->position, obs_snap, realworld_contours);
+        if (verbose) {
+            int total_vertices = 0;
+            for (const auto& c : realworld_contours) total_vertices += c.size();
+            static int contour_dbg_ctr = 0;
+            if (++contour_dbg_ctr % 10 == 0) {
+                printf("[FAR] contour: obs_pts=%zu  contours=%zu  vertices=%d\n",
+                       obs_snap.size(), realworld_contours.size(), total_vertices);
+                fflush(stdout);
+            }
+        }
 #endif
 
         // 3. Update contour graph
         contour_mgr.UpdateContourGraph(odom_node, realworld_contours);
+
+        // 3b. Adjust contour node heights from terrain
+#ifdef USE_PCL
+        map_handler.AdjustCTNodeHeight(g_contour_graph);
+#endif
 
         // 4. Update global near nodes
         graph_mgr.UpdateGlobalNearNodes();
@@ -1624,6 +2561,14 @@ int main(int argc, char** argv) {
 
         // 6. Update navigation graph edges
         graph_mgr.UpdateNavGraph(new_nodes, false);
+
+        // 6b. Remove stale contour-match nodes not re-observed
+        graph_mgr.CleanupStaleNodes();
+
+        // 6c. Adjust nav node heights from terrain
+#ifdef USE_PCL
+        map_handler.AdjustNodesHeight(g_global_graph_nodes);
+#endif
 
         // 7. Extract global contours for polygon collision checking
         contour_mgr.ExtractGlobalContours();
@@ -1663,7 +2608,9 @@ int main(int argc, char** argv) {
             Point3D cur_goal;
             bool is_fail = false, is_succeed = false;
 
-            if (planner.PathToGoal(gp, global_path, nav_wp, cur_goal, is_fail, is_succeed) && nav_wp) {
+            planner.PathToGoal(gp, global_path, nav_wp, cur_goal, is_fail, is_succeed);
+
+            if (!is_fail && nav_wp) {
                 // Publish graph-planned waypoint
                 geometry_msgs::PointStamped wp_msg;
                 wp_msg.header = dimos::make_header(G.worldFrameId,
@@ -1671,7 +2618,9 @@ int main(int argc, char** argv) {
                         std::chrono::system_clock::now().time_since_epoch()).count());
                 wp_msg.point.x = nav_wp->position.x;
                 wp_msg.point.y = nav_wp->position.y;
-                wp_msg.point.z = nav_wp->position.z;
+                // Use robot's z — graph node z can be wrong with sparse terrain
+                // data. The local planner only uses x,y for 2D path generation.
+                wp_msg.point.z = odom_node->position.z;
                 lcm.publish(topic_wp, &wp_msg);
 
                 float dist_to_goal = (odom_node->position - cur_goal).norm();
@@ -1686,9 +2635,19 @@ int main(int argc, char** argv) {
                     fflush(stdout);
                 }
             } else if (is_fail) {
-                // Graph too sparse to plan — do NOT publish the goal
-                // directly as waypoint (that drives the robot into walls).
-                // Wait for the graph to grow via exploration or manual driving.
+                // No valid path — publish robot's current position as waypoint
+                // to stop the robot from driving into walls. This matches the
+                // original's behavior in PlanningCallBack.
+                {
+                    geometry_msgs::PointStamped stop_wp;
+                    stop_wp.header = dimos::make_header(G.worldFrameId,
+                        std::chrono::duration<double>(
+                            std::chrono::system_clock::now().time_since_epoch()).count());
+                    stop_wp.point.x = odom_node->position.x;
+                    stop_wp.point.y = odom_node->position.y;
+                    stop_wp.point.z = odom_node->position.z;
+                    lcm.publish(topic_wp, &stop_wp);
+                }
 
                 // Count how many graph nodes are traversable and connected to goal
                 int traversable_count = 0, goal_connected = 0;
@@ -1699,16 +2658,14 @@ int main(int argc, char** argv) {
                     (void)cn; goal_connected++;
                 }
 
-                if (verbose) {
-                    printf("[FAR] NO ROUTE → goal=(%.2f,%.2f,%.2f)  "
-                           "robot=(%.2f,%.2f)  graph_nodes=%zu  traversable=%d  "
-                           "goal_edges=%d  dist=%.1fm\n",
-                           cur_goal.x, cur_goal.y, cur_goal.z,
-                           odom_node->position.x, odom_node->position.y,
-                           nav_graph.size(), traversable_count, goal_connected,
-                           (odom_node->position - cur_goal).norm());
-                    fflush(stdout);
-                }
+                printf("[FAR] NO ROUTE → goal=(%.2f,%.2f,%.2f)  "
+                       "robot=(%.2f,%.2f)  graph_nodes=%zu  traversable=%d  "
+                       "goal_edges=%d  dist=%.1fm  (published stop)\n",
+                       cur_goal.x, cur_goal.y, cur_goal.z,
+                       odom_node->position.x, odom_node->position.y,
+                       nav_graph.size(), traversable_count, goal_connected,
+                       (odom_node->position - cur_goal).norm());
+                fflush(stdout);
             }
 
             if (is_succeed) {
