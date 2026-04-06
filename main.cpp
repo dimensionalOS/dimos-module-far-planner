@@ -43,6 +43,13 @@
 #include "dimos_native_module.hpp"
 #include "point_cloud_utils.hpp"
 
+// ---------------------------------------------------------------------------
+// Debug logging (enabled at runtime via DIMOS_DEBUG=1)
+// ---------------------------------------------------------------------------
+static bool dimosDebug = false;
+#define DBG(...) do { if (dimosDebug) { printf("[FAR][DEBUG] " __VA_ARGS__); fflush(stdout); } } while (0)
+#define DBG_EVERY(N, ...) do { if (dimosDebug) { static int _c=0; if ((++_c % (N)) == 0) { printf("[FAR][DEBUG] " __VA_ARGS__); fflush(stdout); } } } while (0)
+
 #include "sensor_msgs/PointCloud2.hpp"
 #include "nav_msgs/Odometry.hpp"
 #include "nav_msgs/Path.hpp"
@@ -400,7 +407,7 @@ struct FARGlobals {
     float vehicle_height = 0.75f;
     float kLeafSize = 0.2f;
     float kHeightVoxel = 0.4f;
-    float kNavClearDist = 0.5f;
+    float kNavClearDist = 1.0f;  // node padding from contour (was 0.5 — equal to robot_dim with zero margin)
     float kNearDist = 0.8f;
     float kMatchDist = 1.8f;
     float kProjectDist = 0.2f;
@@ -1128,7 +1135,10 @@ struct GraphPlanner {
         origin_goal_pos = goal_node->position;
         path_momentum_counter = 0;
         recorded_path.clear();
-        printf("[FAR] New goal set at (%.2f, %.2f, %.2f)\n", adj_goal.x, adj_goal.y, adj_goal.z);
+        printf("[FAR] New goal set at (%.2f, %.2f, %.2f)  input=(%.2f, %.2f)  %s\n",
+               goal_node->position.x, goal_node->position.y, goal_node->position.z,
+               goal.x, goal.y,
+               is_use_internav_goal ? "(snapped to internav)" : "(new node)");
     }
 
     bool PathToGoal(const NavNodePtr& goal_ptr, NodePtrStack& global_path,
@@ -1161,10 +1171,11 @@ struct GraphPlanner {
                 // (heading dot product < 0), use recorded path for up to momentum_thred cycles.
                 // Ref: graph_planner.cpp:198-223 momentum navigation
                 if (is_global_path_init && path_momentum_counter < momentum_thred && !recorded_path.empty()) {
-                    // Compare heading: prev_wp → odom vs odom → new_wp
+                    // Compare travel direction: old = (prev_wp - odom), new = (new_wp - odom).
+                    // dot < 0 ⟹ new path points opposite the previous first hop (heading reversal).
                     NavNodePtr prev_wp = (recorded_path.size() >= 2) ? recorded_path[1] : nullptr;
                     if (prev_wp && new_wp != prev_wp) {
-                        Point3D old_dir = odom_node->position - prev_wp->position;
+                        Point3D old_dir = prev_wp->position - odom_node->position;
                         Point3D new_dir = new_wp->position - odom_node->position;
                         float dot = old_dir.x*new_dir.x + old_dir.y*new_dir.y;
                         if (dot < 0.0f) {
@@ -1312,7 +1323,13 @@ struct DynamicGraphManager {
             if (!cur_internav) cur_internav = np;
             last_internav = cur_internav;
             cur_internav = np;
+            DBG("internav-node created at (%.2f,%.2f)\n",
+                G.free_odom_p.x, G.free_odom_p.y);
         }
+
+        // Per-call stats for contour node generation
+        int ct_total = 0, ct_pillar = 0, ct_far = 0, ct_badz = 0, ct_zero_dir = 0;
+        int created = 0, updated = 0, too_close = 0;
 
         // Promote contour vertices to nav graph nodes, or update existing
         // nodes that match.  The original does this via MatchContourWithNavGraph
@@ -1320,22 +1337,39 @@ struct DynamicGraphManager {
         //   - updates an existing contour-match node's position (running average)
         //   - creates a new nav node if no match exists
         for (const auto& ct : g_contour_graph) {
-            if (ct->free_direct == PILLAR) continue;
+            ct_total++;
+            if (ct->free_direct == PILLAR) { ct_pillar++; continue; }
 
             // Only process vertices within sensor range
-            if ((ct->position - G.robot_pos).norm_flat() > G.kSensorRange) continue;
+            if ((ct->position - G.robot_pos).norm_flat() > G.kSensorRange) { ct_far++; continue; }
 
-            // Compute offset position in free space
+            // Compute offset direction into free space.
+            //
+            // For CONCAVE vertices, surf_dirs already point into free space
+            // (see IsInCoverageDirPairs line ~617). For CONVEX vertices, the
+            // same function uses NEGATED surf_dirs, meaning the raw vectors
+            // point into the obstacle. Flip the sign accordingly so nav_pos
+            // is always pushed out of the wall.
             Point3D offset_dir;
             if (ct->surf_dirs.first.z > -0.5f && ct->surf_dirs.second.z > -0.5f) {
-                offset_dir = (ct->surf_dirs.first + ct->surf_dirs.second);
+                Point3D raw_sum = ct->surf_dirs.first + ct->surf_dirs.second;
+                if (ct->free_direct == CONVEX) raw_sum = -raw_sum;
+                offset_dir = raw_sum;
                 float len = offset_dir.norm_flat();
                 if (len > EPSILON_VAL) {
                     offset_dir = offset_dir * (1.0f / len);
                 } else {
+                    ct_zero_dir++;
+                    DBG("vertex skipped: colinear surf_dirs at (%.2f,%.2f) "
+                        "dirs=[(%.2f,%.2f),(%.2f,%.2f)] free_direct=%d\n",
+                        ct->position.x, ct->position.y,
+                        ct->surf_dirs.first.x, ct->surf_dirs.first.y,
+                        ct->surf_dirs.second.x, ct->surf_dirs.second.y,
+                        (int)ct->free_direct);
                     continue;
                 }
             } else {
+                ct_badz++;
                 continue;
             }
             Point3D nav_pos = ct->position + offset_dir * G.kNavClearDist;
@@ -1355,6 +1389,7 @@ struct DynamicGraphManager {
             if (matched) {
                 // Update existing node with running average (simple position filter)
                 float alpha = 0.3f;
+                Point3D pre_pos = matched->position;
                 matched->position.x = matched->position.x * (1-alpha) + nav_pos.x * alpha;
                 matched->position.y = matched->position.y * (1-alpha) + nav_pos.y * alpha;
                 matched->surf_dirs = ct->surf_dirs;
@@ -1365,16 +1400,24 @@ struct DynamicGraphManager {
                 matched->is_covered = true;  // re-observed → mark covered for Dijkstra
                 matched->is_boundary = false;  // boundary flag is for boundary handler module
                 matched->clear_dumper_count = 0;  // reset stale counter
+                updated++;
+                DBG("node-update id=%d was=(%.2f,%.2f) → (%.2f,%.2f)  "
+                    "ct=(%.2f,%.2f) off=(%.2f,%.2f)×%.2f free_direct=%d\n",
+                    matched->id, pre_pos.x, pre_pos.y,
+                    matched->position.x, matched->position.y,
+                    ct->position.x, ct->position.y,
+                    offset_dir.x, offset_dir.y, G.kNavClearDist,
+                    (int)ct->free_direct);
             } else {
                 // Also check against new nodes added this cycle
-                bool too_close = false;
+                bool close_to_new = false;
                 for (const auto& nn : new_nodes) {
                     if ((nn->position - nav_pos).norm_flat() < G.kMatchDist) {
-                        too_close = true;
+                        close_to_new = true;
                         break;
                     }
                 }
-                if (too_close) continue;
+                if (close_to_new) { too_close++; continue; }
 
                 NavNodePtr np;
                 CreateNavNodeFromPoint(nav_pos, np, false, false);
@@ -1386,8 +1429,22 @@ struct DynamicGraphManager {
                 np->ctnode = ct;
                 ct->is_global_match = true;  // mark CTNode as matched
                 new_nodes.push_back(np);
+                created++;
+                DBG("node-create id=%d at (%.2f,%.2f)  ct=(%.2f,%.2f) "
+                    "off=(%.2f,%.2f)×%.2f free_direct=%d surf=[(%.2f,%.2f),(%.2f,%.2f)]\n",
+                    np->id, np->position.x, np->position.y,
+                    ct->position.x, ct->position.y,
+                    offset_dir.x, offset_dir.y, G.kNavClearDist,
+                    (int)ct->free_direct,
+                    ct->surf_dirs.first.x, ct->surf_dirs.first.y,
+                    ct->surf_dirs.second.x, ct->surf_dirs.second.y);
             }
         }
+        DBG_EVERY(10, "extract summary: contours=%d pillar=%d far=%d bad_z=%d "
+                      "zero_dir=%d too_close=%d  created=%d updated=%d  "
+                      "kNavClearDist=%.2f\n",
+                  ct_total, ct_pillar, ct_far, ct_badz,
+                  ct_zero_dir, too_close, created, updated, G.kNavClearDist);
         // Establish contour connections between adjacent matched nav nodes
         // on the same polygon. This populates g_boundary_contour_set via
         // AddContourConnect → AddContourToSets, giving the collision check
@@ -2372,6 +2429,12 @@ int main(int argc, char** argv) {
     // Line-buffer stdout so logs are visible in real-time through subprocess pipe
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
+    // Enable verbose debug logging when DIMOS_DEBUG env var is set to a
+    // non-empty, non-zero value.
+    if (const char* dbg = std::getenv("DIMOS_DEBUG")) {
+        dimosDebug = (dbg[0] != '\0' && std::string(dbg) != "0");
+    }
+
     dimos::NativeModule mod(argc, argv);
 
     // --- Read configurable parameters from CLI args ---
@@ -2396,7 +2459,7 @@ int main(int argc, char** argv) {
     G.kHeightVoxel     = G.kLeafSize * 2.0f;
     G.kNearDist        = G.robot_dim;
     G.kMatchDist       = G.robot_dim * 2.0f + G.kLeafSize;
-    G.kNavClearDist    = G.robot_dim / 2.0f + G.kLeafSize;
+    G.kNavClearDist    = G.robot_dim * 2.0f + G.kLeafSize;  // 2×radius + voxel — real safety margin (was 0.35m with the /2 formula, equal to robot radius with zero margin)
     G.kProjectDist     = G.kLeafSize;
     G.kTolerZ          = floor_height - G.kHeightVoxel;
     float cell_height  = floor_height / 2.5f;
@@ -2502,6 +2565,27 @@ int main(int argc, char** argv) {
     const int loop_ms = (int)(1000.0f / main_freq);
 
     printf("[FAR] Entering main loop (period=%dms)...\n", loop_ms);
+
+    // Waypoint hysteresis state: skip re-publishing when the new chosen
+    // waypoint lies within wp_hysteresis_dist of the last published one for
+    // the same goal. Without this the local planner gets spammed with
+    // micro-updates as obstacle polygons / ray-casts flicker between cycles
+    // and Dijkstra picks slightly different first hops.
+    Point3D last_published_wp;
+    Point3D last_published_goal;
+    bool has_published_wp = false;
+    const float wp_hysteresis_dist = 0.3f;  // meters
+
+    // Sticky first-hop state: keep publishing the same graph node across
+    // cycles as long as it's still reachable from the robot and the goal
+    // hasn't changed. Resists path thrashing when the graph grows/edits
+    // faster than the robot can advance. Only switch when:
+    //   - sticky node is no longer reachable via direct robot→node line,
+    //   - robot has closed to within converge_dist (time to advance),
+    //   - goal coordinates changed, or
+    //   - sticky node pointer was pruned from the graph.
+    NavNodePtr sticky_wp_node = nullptr;
+    Point3D sticky_wp_goal;
 
     // --- Main loop ---
     // Drain LCM messages continuously, run planning at update_rate.
@@ -2748,7 +2832,153 @@ int main(int argc, char** argv) {
 
             planner.PathToGoal(gp, global_path, nav_wp, cur_goal, is_fail, is_succeed);
 
-            if (!is_fail && nav_wp) {
+            if (is_succeed) {
+                // Goal reached — publish robot's current position as the
+                // waypoint so LocalPlanner stops driving. Historically this
+                // branch fell through and published `nav_wp->position`
+                // (the just-reached goal node), which confused LocalPlanner
+                // into chasing a stale point — especially when UpdateGoal
+                // snapped the new goal to an existing internav node.
+                geometry_msgs::PointStamped stop_wp;
+                stop_wp.header = dimos::make_header(G.worldFrameId,
+                    std::chrono::duration<double>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                stop_wp.point.x = odom_node->position.x;
+                stop_wp.point.y = odom_node->position.y;
+                stop_wp.point.z = odom_node->position.z;
+                lcm.publish(topic_wp, &stop_wp);
+                has_published_wp = false;  // clear hysteresis state on reach
+                sticky_wp_node = nullptr;  // clear sticky on goal reached
+            } else if (!is_fail && nav_wp) {
+                // Defensive re-validation: Dijkstra may select a first hop
+                // whose edge from the robot crosses known obstacles (because
+                // graph edges aren't always re-verified against the current
+                // obstacle cloud). Re-run poly + ray checks on the direct
+                // robot→nav_wp segment; if blocked, walk forward along the
+                // path looking for the first node that IS visible from the
+                // robot. If none found, publish a stop.
+                auto robot_to_node_free = [&](const NavNodePtr& n) -> bool {
+                    if (!n) return false;
+                    if (!IsNavNodesConnectFreePolygon(odom_node, n)) return false;
+                    if (g_obstacle_raycast &&
+                        g_obstacle_raycast(odom_node->position, n->position)) {
+                        return false;
+                    }
+                    return true;
+                };
+                {
+                    bool first_hop_free = robot_to_node_free(nav_wp);
+                    if (!first_hop_free) {
+                        // Walk further along the global path looking for a
+                        // later node that IS directly visible from the robot.
+                        // Search from the end toward the front (prefer the
+                        // furthest-visible node, closest to the goal).
+                        NavNodePtr alt = nullptr;
+                        int alt_idx = -1;
+                        int skipped = 0;
+                        for (int i = (int)global_path.size() - 1; i >= 1; i--) {
+                            if (global_path[i] == nav_wp) continue;  // already tried
+                            if (robot_to_node_free(global_path[i])) {
+                                alt = global_path[i];
+                                alt_idx = i;
+                                break;
+                            }
+                            skipped++;
+                        }
+                        if (alt) {
+                            static int skip_dbg = 0;
+                            if (++skip_dbg % 5 == 0) {
+                                printf("[FAR] WP skipped blocked first hop (%.2f,%.2f) → "
+                                       "using path[%d]=(%.2f,%.2f) (searched %d, path_len=%zu)\n",
+                                       nav_wp->position.x, nav_wp->position.y,
+                                       alt_idx, alt->position.x, alt->position.y,
+                                       skipped, global_path.size());
+                                fflush(stdout);
+                            }
+                            nav_wp = alt;
+                        } else {
+                            geometry_msgs::PointStamped stop_wp;
+                            stop_wp.header = dimos::make_header(G.worldFrameId,
+                                std::chrono::duration<double>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count());
+                            stop_wp.point.x = odom_node->position.x;
+                            stop_wp.point.y = odom_node->position.y;
+                            stop_wp.point.z = odom_node->position.z;
+                            lcm.publish(topic_wp, &stop_wp);
+                            has_published_wp = false;
+                            sticky_wp_node = nullptr;  // everything blocked, drop sticky
+                            static int blocked_dbg = 0;
+                            if (++blocked_dbg % 5 == 0) {
+                                printf("[FAR] WP BLOCKED → every node on path[1..%zu] blocked from "
+                                       "robot=(%.2f,%.2f) (publishing stop)\n",
+                                       global_path.size(),
+                                       odom_node->position.x, odom_node->position.y);
+                                fflush(stdout);
+                            }
+                            goto post_publish;
+                        }
+                    }
+                }
+
+                // Sticky first-hop: if the previously-chosen first hop is
+                // still in the graph, still visible from the robot, and
+                // the robot hasn't approached it (within converge_dist),
+                // keep using it. Prevents Dijkstra from thrashing the path
+                // as new nodes/edges are added each cycle.
+                {
+                    bool sticky_goal_same =
+                        sticky_wp_node &&
+                        std::abs(cur_goal.x - sticky_wp_goal.x) < 1e-3f &&
+                        std::abs(cur_goal.y - sticky_wp_goal.y) < 1e-3f;
+                    // Check that sticky node is still present in the current graph
+                    // (it may have been pruned by CleanupStaleNodes).
+                    bool sticky_alive = false;
+                    if (sticky_goal_same) {
+                        for (const auto& n : planner.current_graph) {
+                            if (n == sticky_wp_node) { sticky_alive = true; break; }
+                        }
+                    }
+                    if (sticky_alive) {
+                        float d_robot = (sticky_wp_node->position -
+                                         odom_node->position).norm_flat();
+                        bool advance = d_robot < planner.converge_dist;
+                        bool sticky_reachable = robot_to_node_free(sticky_wp_node);
+                        if (sticky_reachable && !advance && sticky_wp_node != nav_wp) {
+                            // Stay the course.
+                            static int sticky_dbg = 0;
+                            if (++sticky_dbg % 10 == 0) {
+                                printf("[FAR] WP sticky: keeping (%.2f,%.2f) "
+                                       "(Dijkstra wanted (%.2f,%.2f); robot dist=%.2f)\n",
+                                       sticky_wp_node->position.x,
+                                       sticky_wp_node->position.y,
+                                       nav_wp->position.x, nav_wp->position.y,
+                                       d_robot);
+                                fflush(stdout);
+                            }
+                            nav_wp = sticky_wp_node;
+                        }
+                    }
+                }
+
+                // Waypoint hysteresis: if the goal hasn't changed and the
+                // newly chosen first hop is within wp_hysteresis_dist of the
+                // previously published one, skip the republish. Stops the
+                // LocalPlanner from being spammed with micro-updates when
+                // Dijkstra flips between neighboring first hops due to
+                // polygon/ray-cast flicker.
+                bool same_goal =
+                    has_published_wp &&
+                    std::abs(cur_goal.x - last_published_goal.x) < 1e-3f &&
+                    std::abs(cur_goal.y - last_published_goal.y) < 1e-3f;
+                float wp_drift = has_published_wp
+                    ? (nav_wp->position - last_published_wp).norm_flat()
+                    : std::numeric_limits<float>::infinity();
+                bool skip_publish = same_goal && wp_drift < wp_hysteresis_dist;
+                if (skip_publish) {
+                    // Too close to last published — suppress spam.
+                    // Still fall through to the is_succeed GOAL REACHED print.
+                } else {
+
                 // Publish graph-planned waypoint
                 geometry_msgs::PointStamped wp_msg;
                 wp_msg.header = dimos::make_header(G.worldFrameId,
@@ -2760,6 +2990,12 @@ int main(int argc, char** argv) {
                 // data. The local planner only uses x,y for 2D path generation.
                 wp_msg.point.z = odom_node->position.z;
                 lcm.publish(topic_wp, &wp_msg);
+                last_published_wp = nav_wp->position;
+                last_published_goal = cur_goal;
+                has_published_wp = true;
+                // Remember what we stuck with so subsequent cycles can compare.
+                sticky_wp_node = nav_wp;
+                sticky_wp_goal = cur_goal;
 
                 // Publish full planned path for visualization
                 {
@@ -2789,6 +3025,7 @@ int main(int argc, char** argv) {
                            cur_goal.x, cur_goal.y, dist_to_goal, vg_time);
                     fflush(stdout);
                 }
+                }  // end: if (!skip_publish)
             } else if (is_fail) {
                 // No valid path — publish robot's current position as waypoint
                 // to stop the robot from driving into walls. This matches the
@@ -2803,6 +3040,8 @@ int main(int argc, char** argv) {
                     stop_wp.point.z = odom_node->position.z;
                     lcm.publish(topic_wp, &stop_wp);
                 }
+                has_published_wp = false;  // clear hysteresis on stop
+                sticky_wp_node = nullptr;  // NO ROUTE, drop sticky
 
                 // Count how many graph nodes are traversable and connected to goal
                 int traversable_count = 0, goal_connected = 0;
@@ -2822,6 +3061,7 @@ int main(int argc, char** argv) {
                        (odom_node->position - cur_goal).norm_flat());
                 fflush(stdout);
             }
+            post_publish:;
 
             if (is_succeed) {
                 printf("[FAR] *** GOAL REACHED *** at (%.2f,%.2f)  "
