@@ -35,42 +35,19 @@
         "type": "github"
       }
     },
-    "lcm-extended": {
-      "inputs": {
-        "flake-utils": [
-          "flake-utils"
-        ],
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1774902379,
-        "narHash": "sha256-gRFvEkbXCEoG4jEmsT+i0bMZ5kDHOtAaPsrbStXjdu4=",
-        "owner": "jeff-hykin",
-        "repo": "lcm_extended",
-        "rev": "7d12ad8546d3daae30528a6c28f2c9ff5b10baf7",
-        "type": "github"
-      },
-      "original": {
-        "owner": "jeff-hykin",
-        "repo": "lcm_extended",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1773821835,
-        "narHash": "sha256-TJ3lSQtW0E2JrznGVm8hOQGVpXjJyXY2guAxku2O9A4=",
+        "lastModified": 1770841267,
+        "narHash": "sha256-9xejG0KoqsoKEGp2kVbXRlEYtFFcDTHjidiuX8hGO44=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "b40629efe5d6ec48dd1efba650c797ddbd39ace0",
+        "rev": "ec7c70d12ce2fc37cb92aff673dcdca89d187bae",
         "type": "github"
       },
       "original": {
         "owner": "NixOS",
-        "ref": "nixos-unstable",
         "repo": "nixpkgs",
+        "rev": "ec7c70d12ce2fc37cb92aff673dcdca89d187bae",
         "type": "github"
       }
     },
@@ -78,7 +55,6 @@
       "inputs": {
         "dimos-lcm": "dimos-lcm",
         "flake-utils": "flake-utils",
-        "lcm-extended": "lcm-extended",
         "nixpkgs": "nixpkgs"
       }
     },
