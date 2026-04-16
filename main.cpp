@@ -37,6 +37,7 @@
 #include "sensor_msgs/PointField.hpp"
 #include "nav_msgs/Odometry.hpp"
 #include "geometry_msgs/PointStamped.hpp"
+#include "std_msgs/Bool.hpp"
 #include "nav_msgs/Path.hpp"
 #include "std_msgs/Header.hpp"
 
@@ -151,6 +152,7 @@ static std::string g_terrain_map_topic;
 static std::string g_registered_scan_topic;
 static std::string g_odometry_topic;
 static std::string g_goal_topic;
+static std::string g_stop_movement_topic;
 static std::string g_way_point_topic;
 static std::string g_goal_path_topic;
 
@@ -236,6 +238,15 @@ public:
         g_has_goal = true;
         g_goal_consumed = false;
         g_goal_cancelled = false;
+    }
+
+    void on_stop_movement(const lcm::ReceiveBuffer* /*rbuf*/,
+                          const std::string& /*channel*/,
+                          const std_msgs::Bool* msg) {
+        if (!msg->data) return;
+        std::lock_guard<std::mutex> lock(g_goal_mutex);
+        g_goal_cancelled = true;
+        g_goal_consumed = true;
     }
 };
 
@@ -402,6 +413,7 @@ int main(int argc, char** argv) {
     g_registered_scan_topic = mod.has("registered_scan") ? mod.topic("registered_scan") : "";
     g_odometry_topic        = mod.has("odometry") ? mod.topic("odometry") : "";
     g_goal_topic            = mod.has("goal") ? mod.topic("goal") : "";
+    g_stop_movement_topic   = mod.has("stop_movement") ? mod.topic("stop_movement") : "";
     g_way_point_topic       = mod.has("way_point") ? mod.topic("way_point") : "";
     g_goal_path_topic       = mod.has("goal_path") ? mod.topic("goal_path") : "";
 
@@ -465,6 +477,8 @@ int main(int argc, char** argv) {
         lcm.subscribe(g_registered_scan_topic, &Handlers::on_registered_scan, &handlers);
     if (!g_goal_topic.empty())
         lcm.subscribe(g_goal_topic, &Handlers::on_goal, &handlers);
+    if (!g_stop_movement_topic.empty())
+        lcm.subscribe(g_stop_movement_topic, &Handlers::on_stop_movement, &handlers);
 
     // ── Set FARUtil static parameters ──────────────────────────────────────
     // These correspond to LoadROSParams() in the original FARMaster.
