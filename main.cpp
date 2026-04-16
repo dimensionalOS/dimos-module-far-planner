@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -181,6 +182,7 @@ static std::mutex g_goal_mutex;
 static geometry_msgs::PointStamped g_latest_goal;
 static bool g_has_goal = false;
 static bool g_goal_consumed = true;  // tracks whether current goal was processed
+static bool g_goal_cancelled = false; // NaN goal = cancel navigation
 
 // ---------------------------------------------------------------------------
 // LCM callback handlers
@@ -224,9 +226,16 @@ public:
                  const std::string& /*channel*/,
                  const geometry_msgs::PointStamped* msg) {
         std::lock_guard<std::mutex> lock(g_goal_mutex);
+        // NaN sentinel = cancel navigation (e.g. teleop took over).
+        if (std::isnan(msg->point.x) || std::isnan(msg->point.y) || std::isnan(msg->point.z)) {
+            g_goal_cancelled = true;
+            g_goal_consumed = true;
+            return;
+        }
         g_latest_goal = *msg;
         g_has_goal = true;
         g_goal_consumed = false;
+        g_goal_cancelled = false;
     }
 };
 
@@ -667,8 +676,13 @@ int main(int argc, char** argv) {
 
         geometry_msgs::PointStamped cur_goal_msg;
         bool have_new_goal = false;
+        bool is_cancelled = false;
         {
             std::lock_guard<std::mutex> lock(g_goal_mutex);
+            if (g_goal_cancelled) {
+                is_cancelled = true;
+                g_goal_cancelled = false;
+            }
             if (g_has_goal && !g_goal_consumed) {
                 cur_goal_msg = g_latest_goal;
                 have_new_goal = true;
@@ -763,6 +777,21 @@ int main(int argc, char** argv) {
                 PointCloudPtr scan_free_cloud(new pcl::PointCloud<PCLPoint>());
                 scan_handler.SetCurrentScanCloud(scan_pcl, scan_free_cloud);
             }
+        }
+
+        // ── Handle goal cancellation (NaN sentinel from teleop) ───────────
+        if (is_cancelled) {
+            has_pending_goal = false;
+            has_published_waypoint = false;
+            last_nav_node = nullptr;
+            graph_planner.GoalReset();
+            // Publish robot position as stop waypoint
+            if (!g_way_point_topic.empty()) {
+                auto wp_msg = point3d_to_lcm_point_stamped(robot_pos, now_sec);
+                g_lcm->publish(g_way_point_topic, &wp_msg);
+            }
+            printf("[far_planner] Goal cancelled — idle until new goal\n");
+            fflush(stdout);
         }
 
         // ── Handle new goal ────────────────────────────────────────────────

@@ -127,6 +127,8 @@ inline float EulerCost(const NavNodePtr& current_node,
     return (current_node->position - neighbor_node->position).norm();
 }
 
+public:
+
 inline void GoalReset() {
     origin_goal_pos_ = Point3D(0,0,0);
     is_goal_in_freespace_ = false;
@@ -136,8 +138,6 @@ inline void GoalReset() {
     }
     goal_node_ptr_ = NULL;
 }
-
-public:
 
 GraphPlanner() = default;
 ~GraphPlanner() = default;
