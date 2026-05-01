@@ -583,6 +583,8 @@ int main(int argc, char** argv) {
         gp_params.free_thred     = mod.arg_int("free_counter_thred", 5);
         gp_params.votes_size     = mod.arg_int("reach_goal_vote_size", 5);
         gp_params.momentum_thred = mod.arg_int("path_momentum_thred", 5);
+        gp_params.path_switch_cost_ratio = mod.arg_float("path_switch_cost_ratio", 0.85f);
+        gp_params.min_path_hold_frames = mod.arg_int("min_path_hold_frames", 10);
         graph_planner.Init(nh, gp_params);
     }
 
@@ -751,34 +753,47 @@ int main(int argc, char** argv) {
         if (have_terrain_ext) {
             PointCloudPtr terrain_ext_pcl = lcm_pc2_to_pcl(cur_terrain_ext);
             if (!terrain_ext_pcl->empty()) {
-                FARUtil::CropPCLCloud(terrain_ext_pcl, robot_pos, sensor_range);
+                // Upstream uses CropBoxCloud with terrain_range, not sensor_range
+                FARUtil::CropPCLCloud(terrain_ext_pcl, robot_pos, FARUtil::kTerrainRange);
                 FARUtil::RemoveNanInfPoints(terrain_ext_pcl);
                 FARUtil::ExtractFreeAndObsCloud(terrain_ext_pcl, free_cloud, obs_cloud);
                 have_new_clouds = true;
-                // Remove known dynamic obstacles before storing in grid (original line 733)
                 if (!FARUtil::IsStaticEnv) {
                     FARUtil::RemoveOverlapCloud(obs_cloud, FARUtil::stack_dyobs_cloud_, true);
                 }
                 map_handler.UpdateObsCloudGrid(obs_cloud);
                 map_handler.UpdateFreeCloudGrid(free_cloud);
-                map_handler.UpdateTerrainHeightGrid(free_cloud, terrain_height_cloud);
+                // NOTE: UpdateTerrainHeightGrid is done later using surround_free_cloud
+                // (matching upstream TerrainCallBack lines 746-747)
             }
         }
 
-        // ── Process terrain_map (alternative terrain input) ────────────────
-        if (have_terrain && !have_terrain_ext) {
+        // ── Process terrain_map (local terrain for TerrainPlanner) ─────────
+        // Upstream: TerrainLocalCallBack populates local_terrain_obs_ from
+        // /terrain_local_cloud. In DimOS, terrain_map serves this role.
+        // When terrain_map_ext is absent, terrain_map also feeds the grids.
+        if (have_terrain) {
             PointCloudPtr terrain_pcl = lcm_pc2_to_pcl(cur_terrain);
             if (!terrain_pcl->empty()) {
-                FARUtil::CropPCLCloud(terrain_pcl, robot_pos, sensor_range);
+                FARUtil::CropPCLCloud(terrain_pcl, robot_pos, FARUtil::kTerrainRange);
                 FARUtil::RemoveNanInfPoints(terrain_pcl);
-                FARUtil::ExtractFreeAndObsCloud(terrain_pcl, free_cloud, obs_cloud);
-                have_new_clouds = true;
+
+                // Populate local_terrain_obs_ (upstream TerrainLocalCallBack)
                 if (!FARUtil::IsStaticEnv) {
-                    FARUtil::RemoveOverlapCloud(obs_cloud, FARUtil::stack_dyobs_cloud_, true);
+                    FARUtil::ExtractFreeAndObsCloud(
+                        terrain_pcl, FARUtil::local_terrain_free_, FARUtil::local_terrain_obs_);
                 }
-                map_handler.UpdateObsCloudGrid(obs_cloud);
-                map_handler.UpdateFreeCloudGrid(free_cloud);
-                map_handler.UpdateTerrainHeightGrid(free_cloud, terrain_height_cloud);
+
+                // When terrain_map_ext is absent, also use terrain_map for grids
+                if (!have_terrain_ext) {
+                    FARUtil::ExtractFreeAndObsCloud(terrain_pcl, free_cloud, obs_cloud);
+                    have_new_clouds = true;
+                    if (!FARUtil::IsStaticEnv) {
+                        FARUtil::RemoveOverlapCloud(obs_cloud, FARUtil::stack_dyobs_cloud_, true);
+                    }
+                    map_handler.UpdateObsCloudGrid(obs_cloud);
+                    map_handler.UpdateFreeCloudGrid(free_cloud);
+                }
             }
         }
 
@@ -847,6 +862,9 @@ int main(int argc, char** argv) {
             PointCloudPtr surround_obs(new pcl::PointCloud<PCLPoint>());
             PointCloudPtr surround_free(new pcl::PointCloud<PCLPoint>());
             map_handler.GetSurroundFreeCloud(surround_free);
+            // Terrain height uses surround free cloud, not frame free cloud
+            // (upstream TerrainCallBack lines 746-747)
+            map_handler.UpdateTerrainHeightGrid(surround_free, terrain_height_cloud);
             map_handler.GetSurroundObsCloud(surround_obs);
             FARUtil::surround_obs_cloud_ = surround_obs;
 
