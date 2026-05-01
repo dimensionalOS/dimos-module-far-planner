@@ -193,9 +193,10 @@ bool GraphPlanner::PathToGoal(const NavNodePtr& goal_ptr,
         }
     }   
     _is_free_nav = is_free_nav_goal_;
+    frames_since_switch_++;
     const NavNodePtr reach_nav_node = is_free_nav_goal_ ? goal_ptr->free_parent : goal_ptr->parent;
     if (reach_nav_node != NULL) { // valid path found
-        if (is_global_path_init_ && path_momentum_counter_ < gp_params_.momentum_thred && 
+        if (is_global_path_init_ && path_momentum_counter_ < gp_params_.momentum_thred &&
             last_waypoint_dist_ > gp_params_.adjust_radius && reach_nav_node != odom_node_ptr_) // momentum navigation
         {   // check for momentum path
             const float cur_waypoint_dist = (odom_node_ptr_->position - next_waypoint_).norm();
@@ -212,20 +213,39 @@ bool GraphPlanner::PathToGoal(const NavNodePtr& goal_ptr,
         NodePtrStack cur_path;
         if (this->ReconstructPath(goal_ptr, is_free_nav_goal_, cur_path)) {
             _nav_node_ptr = this->NextNavWaypointFromPath(cur_path, goal_ptr);
-            if (is_global_path_init_ && path_momentum_counter_ < gp_params_.momentum_thred) { // momentum navigation
+
+            // --- Anti-churn: enforce hold time + heading reversal guard ---
+            if (is_global_path_init_) {
                 const float cur_waypoint_dist = (odom_node_ptr_->position - _nav_node_ptr->position).norm();
-                if (last_waypoint_dist_ > gp_params_.adjust_radius && cur_waypoint_dist > gp_params_.adjust_radius) {
-                    const float heading_dot = (next_waypoint_ - last_planning_odom_).norm_dot(_nav_node_ptr->position - odom_node_ptr_->position);
-                    if (heading_dot < 0.0f) { // consistant heading momentum
-                        global_path = recorded_path_;
-                        _nav_node_ptr = this->NextNavWaypointFromPath(global_path, goal_ptr);
-                        path_momentum_counter_ ++;
-                        if (FARUtil::IsDebug) RCLCPP_INFO_STREAM(nh_->get_logger(), "Momentum path counter: " << path_momentum_counter_ << "; Over max: "<< gp_params_.momentum_thred);
-                        return true;
+                const float moved_since_record = (odom_node_ptr_->position - last_planning_odom_).norm();
+
+                // Check 1: minimum hold time — don't switch too quickly
+                if (frames_since_switch_ < gp_params_.min_path_hold_frames) {
+                    global_path = recorded_path_;
+                    _nav_node_ptr = this->NextNavWaypointFromPath(global_path, goal_ptr);
+                    path_momentum_counter_++;
+                    if (FARUtil::IsDebug) RCLCPP_INFO_STREAM(nh_->get_logger(), "Hold path (frame " << frames_since_switch_ << "/" << gp_params_.min_path_hold_frames << ")");
+                    return true;
+                }
+
+                // Check 2: heading reversal guard — only when robot hasn't moved much
+                // If robot moved significantly (> converge_dist), the old heading is stale
+                // and a new direction is legitimate (e.g., new goal in opposite direction)
+                if (moved_since_record < gp_params_.converge_dist) {
+                    if (last_waypoint_dist_ > gp_params_.adjust_radius && cur_waypoint_dist > gp_params_.adjust_radius) {
+                        const float heading_dot = (next_waypoint_ - last_planning_odom_).norm_dot(_nav_node_ptr->position - odom_node_ptr_->position);
+                        if (heading_dot < 0.0f) {
+                            global_path = recorded_path_;
+                            _nav_node_ptr = this->NextNavWaypointFromPath(global_path, goal_ptr);
+                            path_momentum_counter_++;
+                            if (FARUtil::IsDebug) RCLCPP_INFO_STREAM(nh_->get_logger(), "Heading reversal blocked (dot=" << heading_dot << ", moved=" << moved_since_record << ")");
+                            return true;
+                        }
                     }
                 }
-            } 
-            // plan new path to goal
+            }
+
+            // Accept new path
             global_path = cur_path;
             this->RecordPathInfo(global_path);
             return true;

@@ -19,6 +19,8 @@ struct GraphPlannerParams {
     int   free_thred;
     int   votes_size;
     int   momentum_thred;
+    float path_switch_cost_ratio = 0.85f;  // only switch if new path cost < ratio * old cost
+    int   min_path_hold_frames = 10;       // minimum frames to hold a path before switching
 };
 
 
@@ -47,6 +49,8 @@ int path_momentum_counter_;
 bool is_global_path_init_;
 float last_waypoint_dist_;
 Point3D last_planning_odom_;
+float recorded_path_cost_ = 0.0f;
+int frames_since_switch_ = 0;
 
 // local terrain map for freespace adjustment
 Point3D grid_center_ = Point3D(0,0,0);
@@ -98,16 +102,26 @@ inline void InitNodesStates(const NodePtrStack& graph) {
     }
 }
 
+inline float ComputePathCost(const NodePtrStack& path) {
+    float cost = 0.0f;
+    for (size_t i = 1; i < path.size(); i++) {
+        cost += (path[i]->position - path[i-1]->position).norm();
+    }
+    return cost;
+}
+
 inline void RecordPathInfo(const NodePtrStack& global_path) {
     if (global_path.size() < 2) {
         if (FARUtil::IsDebug) RCLCPP_ERROR(nh_->get_logger(), "GP: recording path for momontum fails, planning path is empty");
         return;
     }
     recorded_path_         = global_path;
+    recorded_path_cost_    = ComputePathCost(global_path);
     next_waypoint_         = global_path[1]->position;
     last_waypoint_dist_    = (odom_node_ptr_->position - next_waypoint_).norm();
     is_global_path_init_   = true;
     path_momentum_counter_ = 0;
+    frames_since_switch_   = 0;
     last_planning_odom_    = odom_node_ptr_->position;
 }
 
