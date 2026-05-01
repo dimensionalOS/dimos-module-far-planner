@@ -158,6 +158,7 @@ static std::string g_goal_path_topic;
 
 // World frame for published messages
 static std::string g_world_frame = "map";
+static float g_wp_churn_dist = 0.0f;  // 0 = publish every cycle (no churn reduction)
 
 // Thread-safe input buffers: odometry
 static std::mutex g_odom_mutex;
@@ -436,6 +437,7 @@ int main(int argc, char** argv) {
     bool  is_viewpoint_extend = mod.arg_bool("is_viewpoint_extend", true);
     float converge_dist       = mod.arg_float("converge_dist", 0.8f);
     g_world_frame             = mod.arg("world_frame", "map");
+    g_wp_churn_dist           = mod.arg_float("wp_churn_dist", 0.0f);
 
     // Remaining params are read inline via mod.arg_*() where they're used.
 
@@ -1172,12 +1174,12 @@ int main(int argc, char** argv) {
                 }
 
                 // Churn reduction: only publish if waypoint moved significantly
-                // or the nav node changed
+                // or the nav node changed. Set wp_churn_dist=0 to disable.
                 const float wp_change_dist = (waypoint - last_published_waypoint).norm();
                 const bool nav_node_changed = (nav_waypoint != last_nav_node);
                 const bool should_publish = !has_published_waypoint ||
                     nav_node_changed ||
-                    wp_change_dist > FARUtil::kLeafSize * 2.0f;
+                    (g_wp_churn_dist > 0 ? wp_change_dist > g_wp_churn_dist : true);
 
                 if (should_publish) {
                     if (!g_way_point_topic.empty()) {
