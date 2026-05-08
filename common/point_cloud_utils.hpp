@@ -20,7 +20,7 @@
 #include <pcl/filters/voxel_grid.h>
 #endif
 
-namespace smartnav {
+namespace smart_nav {
 
 // Simple XYZI point structure (no PCL dependency)
 struct PointXYZI {
@@ -167,4 +167,4 @@ inline void quat_to_rpy(double qx, double qy, double qz, double qw,
     yaw = std::atan2(siny_cosp, cosy_cosp);
 }
 
-}  // namespace smartnav
+}  // namespace smart_nav

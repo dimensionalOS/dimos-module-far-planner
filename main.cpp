@@ -1,1726 +1,1230 @@
-// FAR Planner — dimos NativeModule port
-// Ported from ROS2 packages:
-//   src/route_planner/far_planner/
-//   src/route_planner/boundary_handler/
-//   src/route_planner/graph_decoder/
-//   src/route_planner/visibility_graph_msg/
+// Copyright 2026 Dimensional Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Builds and maintains a visibility graph from obstacle boundaries detected in
-// registered point clouds.  Uses contour detection (OpenCV) to extract obstacle
-// polygons, constructs a dynamic navigation graph with shortest-path planning
-// to the navigation goal, and publishes intermediate waypoints for the local
-// planner.
+// FAR Planner native module for dimos NativeModule framework.
 //
-// LCM inputs:  registered_scan (PointCloud2), odometry (Odometry), goal (PointStamped)
-// LCM outputs: way_point (PointStamped)
+// Replaces the ROS2 FARMaster node with CLI arg parsing + LCM pub/sub.
+// The algorithm modules (ContourDetector, DynamicGraph, GraphPlanner,
+// ContourGraph, MapHandler, ScanHandler) are called directly — FARMaster
+// is bypassed because it is too tightly coupled to ROS.
+//
+// Usage:
+//   ./far_planner_native \
+//       --terrain_map_ext '/terrain_map_ext#sensor_msgs.PointCloud2' \
+//       --terrain_map '/terrain_map#sensor_msgs.PointCloud2' \
+//       --registered_scan '/registered_scan#sensor_msgs.PointCloud2' \
+//       --odometry '/odometry#nav_msgs.Odometry' \
+//       --goal '/goal#geometry_msgs.PointStamped' \
+//       --way_point '/way_point#geometry_msgs.PointStamped' \
+//       --goal_path '/goal_path#nav_msgs.Path' \
+//       --update_rate 5.0 --sensor_range 15.0
 
-#include <algorithm>
+#include <lcm/lcm-cpp.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
-#include <cstdlib>
-#include <deque>
-#include <functional>
-#include <iostream>
-#include <limits>
-#include <memory>
+#include <cstring>
 #include <mutex>
-#include <numeric>
-#include <queue>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
 #include <vector>
 
-#include <Eigen/Core>
+// dimos-lcm message types
+#include "sensor_msgs/PointCloud2.hpp"
+#include "sensor_msgs/PointField.hpp"
+#include "nav_msgs/Odometry.hpp"
+#include "geometry_msgs/PointStamped.hpp"
+#include "std_msgs/Bool.hpp"
+#include "nav_msgs/Path.hpp"
+#include "std_msgs/Header.hpp"
 
-#include <lcm/lcm-cpp.hpp>
-
+// SmartNav common helpers
 #include "dimos_native_module.hpp"
 #include "point_cloud_utils.hpp"
 
-#include "sensor_msgs/PointCloud2.hpp"
-#include "nav_msgs/Odometry.hpp"
-#include "geometry_msgs/PointStamped.hpp"
-
-#ifdef USE_PCL
-#include <pcl/point_types.h>
-#include <pcl/point_cloud.h>
-#include <pcl/common/distances.h>
-#include <pcl/common/transforms.h>
-#include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/crop_box.h>
-#include <pcl/filters/extract_indices.h>
-#include <pcl/kdtree/kdtree_flann.h>
-#include <pcl/search/kdtree.h>
-#include <boost/functional/hash.hpp>
-#endif
-
-#ifdef HAS_OPENCV
-#include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/highgui.hpp>
-#endif
-
-using namespace std;
+// FAR Planner core (via compat layer — no ROS deps)
+#include "far_planner/compat.h"
+#include "far_planner/utility.h"
+#include "far_planner/contour_detector.h"
+#include "far_planner/dynamic_graph.h"
+#include "far_planner/graph_planner.h"
+#include "far_planner/contour_graph.h"
+#include "far_planner/map_handler.h"
+#include "far_planner/scan_handler.h"
 
 // ---------------------------------------------------------------------------
-//  Signal handling
+// FARUtil static definitions (normally in far_planner.cpp — we bypass that file)
 // ---------------------------------------------------------------------------
-static std::atomic<bool> g_shutdown{false};
-static void signal_handler(int) { g_shutdown.store(true); }
 
-// ---------------------------------------------------------------------------
-//  Constants
-// ---------------------------------------------------------------------------
-#define EPSILON_VAL 1e-7f
+PointCloudPtr  FARUtil::surround_obs_cloud_  = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::surround_free_cloud_ = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::stack_new_cloud_     = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::cur_new_cloud_       = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::cur_dyobs_cloud_     = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::stack_dyobs_cloud_   = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::cur_scan_cloud_      = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::local_terrain_obs_   = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointCloudPtr  FARUtil::local_terrain_free_  = PointCloudPtr(new pcl::PointCloud<PCLPoint>());
+PointKdTreePtr FARUtil::kdtree_new_cloud_    = PointKdTreePtr(new pcl::KdTreeFLANN<PCLPoint>());
+PointKdTreePtr FARUtil::kdtree_filter_cloud_ = PointKdTreePtr(new pcl::KdTreeFLANN<PCLPoint>());
 
-// ---------------------------------------------------------------------------
-//  Point3D — lightweight 3D point with arithmetic operators
-//  (Port of far_planner/point_struct.h)
-// ---------------------------------------------------------------------------
-struct Point3D {
-    float x, y, z;
-    float intensity;
-    Point3D() : x(0), y(0), z(0), intensity(0) {}
-    Point3D(float _x, float _y, float _z) : x(_x), y(_y), z(_z), intensity(0) {}
-    Point3D(float _x, float _y, float _z, float _i) : x(_x), y(_y), z(_z), intensity(_i) {}
-    Point3D(Eigen::Vector3f v) : x(v(0)), y(v(1)), z(v(2)), intensity(0) {}
-    Point3D(Eigen::Vector3d v) : x(v(0)), y(v(1)), z(v(2)), intensity(0) {}
+const float FARUtil::kEpsilon = 1e-7f;
+const float FARUtil::kINF     = std::numeric_limits<float>::max();
+std::string FARUtil::worldFrameId;
+float   FARUtil::kAngleNoise;
+Point3D FARUtil::robot_pos;
+Point3D FARUtil::odom_pos;
+Point3D FARUtil::map_origin;
+Point3D FARUtil::free_odom_p;
+float   FARUtil::robot_dim;
+float   FARUtil::vehicle_height;
+float   FARUtil::kLeafSize;
+float   FARUtil::kHeightVoxel;
+float   FARUtil::kNavClearDist;
+float   FARUtil::kCellLength;
+float   FARUtil::kCellHeight;
+float   FARUtil::kNewPIThred;
+float   FARUtil::kSensorRange;
+float   FARUtil::kMarginDist;
+float   FARUtil::kMarginHeight;
+float   FARUtil::kTerrainRange;
+float   FARUtil::kLocalPlanRange;
+float   FARUtil::kFreeZ;
+float   FARUtil::kVizRatio;
+double  FARUtil::systemStartTime;
+float   FARUtil::kObsDecayTime;
+float   FARUtil::kNewDecayTime;
+float   FARUtil::kNearDist;
+float   FARUtil::kMatchDist;
+float   FARUtil::kProjectDist;
+int     FARUtil::kDyObsThred;
+int     FARUtil::KNewPointC;
+int     FARUtil::kObsInflate;
+float   FARUtil::kTolerZ;
+float   FARUtil::kAcceptAlign;
+bool    FARUtil::IsStaticEnv;
+bool    FARUtil::IsDebug;
+bool    FARUtil::IsMultiLayer;
+TimeMeasure FARUtil::Timer;
 
-    bool operator==(const Point3D& p) const {
-        return fabs(x-p.x)<EPSILON_VAL && fabs(y-p.y)<EPSILON_VAL && fabs(z-p.z)<EPSILON_VAL;
-    }
-    bool operator!=(const Point3D& p) const { return !(*this == p); }
-    float operator*(const Point3D& p) const { return x*p.x + y*p.y + z*p.z; }
-    Point3D operator*(float f) const { return {x*f, y*f, z*f}; }
-    Point3D operator/(float f) const { return {x/f, y/f, z/f}; }
-    Point3D operator+(const Point3D& p) const { return {x+p.x, y+p.y, z+p.z}; }
-    Point3D operator-(const Point3D& p) const { return {x-p.x, y-p.y, z-p.z}; }
-    Point3D operator-() const { return {-x, -y, -z}; }
+// DynamicGraph statics
+DynamicGraphParams DynamicGraph::dg_params_;
+NodePtrStack DynamicGraph::globalGraphNodes_;
+std::size_t  DynamicGraph::id_tracker_;
+std::unordered_map<std::size_t, NavNodePtr> DynamicGraph::idx_node_map_;
+std::unordered_map<NavNodePtr, std::pair<int, std::unordered_set<NavNodePtr>>> DynamicGraph::out_contour_nodes_map_;
 
-    float norm() const { return std::hypot(x, std::hypot(y, z)); }
-    float norm_flat() const { return std::hypot(x, y); }
+// ContourGraph statics
+CTNodeStack ContourGraph::polys_ctnodes_;
+CTNodeStack ContourGraph::contour_graph_;
+PolygonStack ContourGraph::contour_polygons_;
+std::vector<PointPair> ContourGraph::global_contour_;
+std::vector<PointPair> ContourGraph::unmatched_contour_;
+std::vector<PointPair> ContourGraph::inactive_contour_;
+std::vector<PointPair> ContourGraph::boundary_contour_;
+std::vector<PointPair> ContourGraph::local_boundary_;
+std::unordered_set<NavEdge, navedge_hash> ContourGraph::global_contour_set_;
+std::unordered_set<NavEdge, navedge_hash> ContourGraph::boundary_contour_set_;
 
-    Point3D normalize() const {
-        float n = norm();
-        return (n > EPSILON_VAL) ? Point3D(x/n, y/n, z/n) : Point3D(0,0,0);
-    }
-    Point3D normalize_flat() const {
-        float n = norm_flat();
-        return (n > EPSILON_VAL) ? Point3D(x/n, y/n, 0.0f) : Point3D(0,0,0);
-    }
-    float norm_dot(Point3D p) const {
-        float n1 = norm(), n2 = p.norm();
-        if (n1 < EPSILON_VAL || n2 < EPSILON_VAL) return 0.f;
-        float d = (x*p.x + y*p.y + z*p.z) / (n1*n2);
-        return std::min(std::max(-1.0f, d), 1.0f);
-    }
-    float norm_flat_dot(Point3D p) const {
-        float n1 = norm_flat(), n2 = p.norm_flat();
-        if (n1 < EPSILON_VAL || n2 < EPSILON_VAL) return 0.f;
-        float d = (x*p.x + y*p.y) / (n1*n2);
-        return std::min(std::max(-1.0f, d), 1.0f);
-    }
-};
-
-typedef std::pair<Point3D, Point3D> PointPair;
-typedef std::vector<Point3D> PointStack;
-
-// ---------------------------------------------------------------------------
-//  Node enums and structures
-//  (Port of far_planner/node_struct.h)
-// ---------------------------------------------------------------------------
-enum NodeFreeDirect { UNKNOW=0, CONVEX=1, CONCAVE=2, PILLAR=3 };
-
-struct NavNode;
-typedef std::shared_ptr<NavNode> NavNodePtr;
-typedef std::pair<NavNodePtr, NavNodePtr> NavEdge;
-
-struct Polygon {
-    std::size_t N;
-    std::vector<Point3D> vertices;
-    bool is_robot_inside;
-    bool is_pillar;
-    float perimeter;
-};
-typedef std::shared_ptr<Polygon> PolygonPtr;
-typedef std::vector<PolygonPtr> PolygonStack;
-
-struct CTNode {
-    Point3D position;
-    bool is_global_match;
-    bool is_contour_necessary;
-    bool is_ground_associate;
-    std::size_t nav_node_id;
-    NodeFreeDirect free_direct;
-    PointPair surf_dirs;
-    PolygonPtr poly_ptr;
-    std::shared_ptr<CTNode> front;
-    std::shared_ptr<CTNode> back;
-    std::vector<std::shared_ptr<CTNode>> connect_nodes;
-};
-typedef std::shared_ptr<CTNode> CTNodePtr;
-typedef std::vector<CTNodePtr> CTNodeStack;
-
-struct NavNode {
-    std::size_t id;
-    Point3D position;
-    PointPair surf_dirs;
-    std::deque<Point3D> pos_filter_vec;
-    std::deque<PointPair> surf_dirs_vec;
-    CTNodePtr ctnode;
-    bool is_active, is_block_frontier, is_contour_match;
-    bool is_odom, is_goal, is_near_nodes, is_wide_near, is_merged;
-    bool is_covered, is_frontier, is_finalized, is_navpoint, is_boundary;
-    int clear_dumper_count;
-    std::deque<int> frontier_votes;
-    std::unordered_set<std::size_t> invalid_boundary;
-    std::vector<NavNodePtr> connect_nodes;
-    std::vector<NavNodePtr> poly_connects;
-    std::vector<NavNodePtr> contour_connects;
-    std::unordered_map<std::size_t, std::deque<int>> contour_votes;
-    std::unordered_map<std::size_t, std::deque<int>> edge_votes;
-    std::vector<NavNodePtr> potential_contours;
-    std::vector<NavNodePtr> potential_edges;
-    std::vector<NavNodePtr> trajectory_connects;
-    std::unordered_map<std::size_t, std::size_t> trajectory_votes;
-    std::unordered_map<std::size_t, std::size_t> terrain_votes;
-    NodeFreeDirect free_direct;
-    // planner members
-    bool is_block_to_goal, is_traversable, is_free_traversable;
-    float gscore, fgscore;
-    NavNodePtr parent, free_parent;
-};
-
-typedef std::vector<NavNodePtr> NodePtrStack;
-typedef std::vector<std::size_t> IdxStack;
-typedef std::unordered_set<std::size_t> IdxSet;
-
-#ifdef USE_PCL
-typedef pcl::PointXYZI PCLPoint;
-typedef pcl::PointCloud<PCLPoint> PointCloud;
-typedef pcl::PointCloud<PCLPoint>::Ptr PointCloudPtr;
-typedef pcl::KdTreeFLANN<PCLPoint>::Ptr PointKdTreePtr;
-#endif
+// MapHandler statics
+PointKdTreePtr MapHandler::kdtree_terrain_clould_;
+std::vector<int> MapHandler::terrain_grid_occupy_list_;
+std::vector<int> MapHandler::terrain_grid_traverse_list_;
+std::unordered_set<int> MapHandler::neighbor_obs_indices_;
+std::unordered_set<int> MapHandler::extend_obs_indices_;
+std::unique_ptr<grid_ns::Grid<PointCloudPtr>> MapHandler::world_free_cloud_grid_;
+std::unique_ptr<grid_ns::Grid<PointCloudPtr>> MapHandler::world_obs_cloud_grid_;
+std::unique_ptr<grid_ns::Grid<std::vector<float>>> MapHandler::terrain_height_grid_;
 
 // ---------------------------------------------------------------------------
-//  Hash/comparison functors for nodes and edges
+// Global state
 // ---------------------------------------------------------------------------
-struct nodeptr_hash {
-    std::size_t operator()(const NavNodePtr& n) const { return std::hash<std::size_t>()(n->id); }
-};
-struct nodeptr_equal {
-    bool operator()(const NavNodePtr& a, const NavNodePtr& b) const { return a->id == b->id; }
-};
-struct navedge_hash {
-    std::size_t operator()(const NavEdge& e) const {
-        std::size_t seed = 0;
-        seed ^= std::hash<std::size_t>()(e.first->id) + 0x9e3779b9 + (seed<<6) + (seed>>2);
-        seed ^= std::hash<std::size_t>()(e.second->id) + 0x9e3779b9 + (seed<<6) + (seed>>2);
-        return seed;
-    }
-};
-struct nodeptr_gcomp {
-    bool operator()(const NavNodePtr& a, const NavNodePtr& b) const { return a->gscore > b->gscore; }
-};
-struct nodeptr_fgcomp {
-    bool operator()(const NavNodePtr& a, const NavNodePtr& b) const { return a->fgscore > b->fgscore; }
-};
-struct nodeptr_icomp {
-    bool operator()(const NavNodePtr& a, const NavNodePtr& b) const { return a->position.intensity < b->position.intensity; }
-};
+
+static std::atomic<bool> g_running{true};
+static lcm::LCM* g_lcm = nullptr;
+
+// Topic strings (set from CLI args)
+static std::string g_terrain_map_ext_topic;
+static std::string g_terrain_map_topic;
+static std::string g_registered_scan_topic;
+static std::string g_odometry_topic;
+static std::string g_goal_topic;
+static std::string g_stop_movement_topic;
+static std::string g_way_point_topic;
+static std::string g_goal_path_topic;
+
+// World frame for published messages
+static std::string g_world_frame = "map";
+static float g_wp_churn_dist = 0.0f;  // 0 = publish every cycle (no churn reduction)
+
+// Thread-safe input buffers: odometry
+static std::mutex g_odom_mutex;
+static nav_msgs::Odometry g_latest_odom;
+static bool g_has_odom = false;
+
+// Thread-safe input buffers: terrain_map_ext
+static std::mutex g_terrain_ext_mutex;
+static sensor_msgs::PointCloud2 g_latest_terrain_ext;
+static bool g_has_terrain_ext = false;
+
+// Thread-safe input buffers: terrain_map
+static std::mutex g_terrain_mutex;
+static sensor_msgs::PointCloud2 g_latest_terrain;
+static bool g_has_terrain = false;
+
+// Thread-safe input buffers: registered_scan
+static std::mutex g_scan_mutex;
+static sensor_msgs::PointCloud2 g_latest_scan;
+static bool g_has_scan = false;
+
+// Thread-safe input buffers: goal
+static std::mutex g_goal_mutex;
+static geometry_msgs::PointStamped g_latest_goal;
+static bool g_has_goal = false;
+static bool g_goal_consumed = true;  // tracks whether current goal was processed
+static bool g_goal_cancelled = false; // NaN goal = cancel navigation
 
 // ---------------------------------------------------------------------------
-//  Line-segment intersection (port of far_planner/intersection.h)
+// LCM callback handlers
 // ---------------------------------------------------------------------------
-#ifdef HAS_OPENCV
-namespace POLYOPS {
-static bool onSegment(cv::Point2f p, cv::Point2f q, cv::Point2f r) {
-    return q.x<=max(p.x,r.x) && q.x>=min(p.x,r.x) && q.y<=max(p.y,r.y) && q.y>=min(p.y,r.y);
-}
-static int orientation(cv::Point2f p, cv::Point2f q, cv::Point2f r) {
-    double val = (q.y-p.y)*(r.x-q.x) - (q.x-p.x)*(r.y-q.y);
-    if (abs(val)<1e-7) return 0;
-    return (val>0)?1:2;
-}
-static bool doIntersect(cv::Point2f p1, cv::Point2f q1, cv::Point2f p2, cv::Point2f q2) {
-    int o1=orientation(p1,q1,p2), o2=orientation(p1,q1,q2);
-    int o3=orientation(p2,q2,p1), o4=orientation(p2,q2,q1);
-    if (o1!=o2 && o3!=o4) return true;
-    if (o1==0 && onSegment(p1,p2,q1)) return true;
-    if (o2==0 && onSegment(p1,q2,q1)) return true;
-    if (o3==0 && onSegment(p2,p1,q2)) return true;
-    if (o4==0 && onSegment(p2,q1,q2)) return true;
-    return false;
-}
-}
-#endif
 
-// ---------------------------------------------------------------------------
-//  ConnectPair, HeightPair — edge helper structures
-// ---------------------------------------------------------------------------
-#ifdef HAS_OPENCV
-struct ConnectPair {
-    cv::Point2f start_p, end_p;
-    ConnectPair() = default;
-    ConnectPair(const cv::Point2f& p1, const cv::Point2f& p2) : start_p(p1), end_p(p2) {}
-    ConnectPair(const Point3D& p1, const Point3D& p2) {
-        start_p.x = p1.x; start_p.y = p1.y;
-        end_p.x = p2.x; end_p.y = p2.y;
-    }
-};
-#endif
-
-struct HeightPair {
-    float minH, maxH;
-    HeightPair() = default;
-    HeightPair(float mn, float mx) : minH(mn), maxH(mx) {}
-    HeightPair(const Point3D& p1, const Point3D& p2) {
-        minH = std::min(p1.z, p2.z);
-        maxH = std::max(p1.z, p2.z);
-    }
-};
-
-// ---------------------------------------------------------------------------
-//  3D Grid template (port of far_planner/grid.h)
-// ---------------------------------------------------------------------------
-namespace grid_ns {
-template <typename _T>
-class Grid {
+class Handlers {
 public:
-    explicit Grid(const Eigen::Vector3i& sz, _T init, const Eigen::Vector3d& orig = Eigen::Vector3d(0,0,0),
-                  const Eigen::Vector3d& res = Eigen::Vector3d(1,1,1), int dim = 3)
-        : origin_(orig), size_(sz), resolution_(res), dimension_(dim) {
-        for (int i=0; i<dimension_; i++) resolution_inv_(i) = 1.0/resolution_(i);
-        cell_number_ = size_.x()*size_.y()*size_.z();
-        cells_.resize(cell_number_);
-        for (int i=0; i<cell_number_; i++) cells_[i] = init;
+    void on_odometry(const lcm::ReceiveBuffer* /*rbuf*/,
+                     const std::string& /*channel*/,
+                     const nav_msgs::Odometry* msg) {
+        std::lock_guard<std::mutex> lock(g_odom_mutex);
+        g_latest_odom = *msg;
+        g_has_odom = true;
     }
-    int GetCellNumber() const { return cell_number_; }
-    Eigen::Vector3i GetSize() const { return size_; }
-    Eigen::Vector3d GetOrigin() const { return origin_; }
-    void SetOrigin(const Eigen::Vector3d& o) { origin_ = o; }
-    Eigen::Vector3d GetResolution() const { return resolution_; }
-    void ReInitGrid(const _T& v) { std::fill(cells_.begin(), cells_.end(), v); }
-    bool InRange(const Eigen::Vector3i& s) const {
-        bool r=true;
-        for (int i=0; i<dimension_; i++) r &= s(i)>=0 && s(i)<size_(i);
-        return r;
-    }
-    bool InRange(int ind) const { return ind>=0 && ind<cell_number_; }
-    int Sub2Ind(int x, int y, int z) const { return x + y*size_.x() + z*size_.x()*size_.y(); }
-    int Sub2Ind(const Eigen::Vector3i& s) const { return Sub2Ind(s.x(),s.y(),s.z()); }
-    Eigen::Vector3i Ind2Sub(int ind) const {
-        Eigen::Vector3i s;
-        s.z() = ind/(size_.x()*size_.y());
-        ind -= s.z()*size_.x()*size_.y();
-        s.y() = ind/size_.x();
-        s.x() = ind%size_.x();
-        return s;
-    }
-    Eigen::Vector3d Sub2Pos(const Eigen::Vector3i& s) const {
-        Eigen::Vector3d p(0,0,0);
-        for (int i=0; i<dimension_; i++) p(i) = origin_(i) + s(i)*resolution_(i) + resolution_(i)/2.0;
-        return p;
-    }
-    Eigen::Vector3d Ind2Pos(int ind) const { return Sub2Pos(Ind2Sub(ind)); }
-    Eigen::Vector3i Pos2Sub(double px, double py, double pz) const { return Pos2Sub(Eigen::Vector3d(px,py,pz)); }
-    Eigen::Vector3i Pos2Sub(const Eigen::Vector3d& p) const {
-        Eigen::Vector3i s(0,0,0);
-        for (int i=0; i<dimension_; i++) s(i) = p(i)-origin_(i)>-1e-7 ? (int)((p(i)-origin_(i))*resolution_inv_(i)) : -1;
-        return s;
-    }
-    int Pos2Ind(const Eigen::Vector3d& p) const { return Sub2Ind(Pos2Sub(p)); }
-    _T& GetCell(int ind) { return cells_[ind]; }
-    _T& GetCell(const Eigen::Vector3i& s) { return cells_[Sub2Ind(s)]; }
-    _T GetCellValue(int ind) const { return cells_[ind]; }
-private:
-    Eigen::Vector3d origin_, resolution_, resolution_inv_;
-    Eigen::Vector3i size_;
-    std::vector<_T> cells_;
-    int cell_number_, dimension_;
-};
-} // namespace grid_ns
 
-// ---------------------------------------------------------------------------
-//  TimeMeasure utility (port of far_planner/time_measure.h)
-// ---------------------------------------------------------------------------
-class TimeMeasure {
-    using Clock = std::chrono::high_resolution_clock;
-    std::unordered_map<std::string, std::chrono::time_point<Clock>> timers_;
-public:
-    void start_time(const std::string& n, bool reset=false) {
-        auto it = timers_.find(n);
-        auto now = Clock::now();
-        if (it == timers_.end()) timers_.insert({n, now});
-        else if (reset) it->second = now;
+    void on_terrain_ext(const lcm::ReceiveBuffer* /*rbuf*/,
+                        const std::string& /*channel*/,
+                        const sensor_msgs::PointCloud2* msg) {
+        std::lock_guard<std::mutex> lock(g_terrain_ext_mutex);
+        g_latest_terrain_ext = *msg;
+        g_has_terrain_ext = true;
     }
-    double end_time(const std::string& n, bool print=true) {
-        auto it = timers_.find(n);
-        if (it != timers_.end()) {
-            auto dur = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-it->second);
-            double ms = dur.count()/1000.0;
-            if (print) printf("    %s Time: %.2fms\n", n.c_str(), ms);
-            timers_.erase(it);
-            return ms;
-        }
-        return -1.0;
+
+    void on_terrain(const lcm::ReceiveBuffer* /*rbuf*/,
+                    const std::string& /*channel*/,
+                    const sensor_msgs::PointCloud2* msg) {
+        std::lock_guard<std::mutex> lock(g_terrain_mutex);
+        g_latest_terrain = *msg;
+        g_has_terrain = true;
     }
-    double record_time(const std::string& n) {
-        auto it = timers_.find(n);
-        if (it != timers_.end()) {
-            auto dur = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-it->second);
-            return dur.count()/1000.0;
+
+    void on_registered_scan(const lcm::ReceiveBuffer* /*rbuf*/,
+                            const std::string& /*channel*/,
+                            const sensor_msgs::PointCloud2* msg) {
+        std::lock_guard<std::mutex> lock(g_scan_mutex);
+        g_latest_scan = *msg;
+        g_has_scan = true;
+    }
+
+    void on_goal(const lcm::ReceiveBuffer* /*rbuf*/,
+                 const std::string& /*channel*/,
+                 const geometry_msgs::PointStamped* msg) {
+        std::lock_guard<std::mutex> lock(g_goal_mutex);
+        // NaN sentinel = cancel navigation (e.g. teleop took over).
+        if (std::isnan(msg->point.x) || std::isnan(msg->point.y) || std::isnan(msg->point.z)) {
+            g_goal_cancelled = true;
+            g_goal_consumed = true;
+            return;
         }
-        return -1.0;
+        g_latest_goal = *msg;
+        g_has_goal = true;
+        g_goal_consumed = false;
+        g_goal_cancelled = false;
+    }
+
+    void on_stop_movement(const lcm::ReceiveBuffer* /*rbuf*/,
+                          const std::string& /*channel*/,
+                          const std_msgs::Bool* msg) {
+        if (!msg->data) return;
+        std::lock_guard<std::mutex> lock(g_goal_mutex);
+        g_goal_cancelled = true;
+        g_goal_consumed = true;
     }
 };
 
 // ---------------------------------------------------------------------------
-//  Global utility class (port of FARUtil statics)
+// Conversion helpers
 // ---------------------------------------------------------------------------
-struct FARGlobals {
-    // constants
-    static constexpr float kEpsilon = 1e-7f;
-    static constexpr float kINF = std::numeric_limits<float>::max();
 
-    // configurable parameters
-    bool is_static_env = true;
-    bool is_debug = false;
-    bool is_multi_layer = false;
-    Point3D robot_pos, odom_pos, map_origin, free_odom_p;
-    float robot_dim = 0.8f;
-    float vehicle_height = 0.75f;
-    float kLeafSize = 0.2f;
-    float kHeightVoxel = 0.4f;
-    float kNavClearDist = 0.5f;
-    float kNearDist = 0.8f;
-    float kMatchDist = 1.8f;
-    float kProjectDist = 0.2f;
-    float kSensorRange = 30.0f;
-    float kMarginDist = 28.0f;
-    float kMarginHeight = 1.2f;
-    float kTerrainRange = 15.0f;
-    float kLocalPlanRange = 5.0f;
-    float kAngleNoise = 0.2618f;  // 15 degrees in rad
-    float kAcceptAlign = 0.2618f;
-    float kCellLength = 5.0f;
-    float kCellHeight = 0.8f;
-    float kNewPIThred = 2.0f;
-    float kFreeZ = 0.1f;
-    float kVizRatio = 1.0f;
-    float kTolerZ = 1.6f;
-    float kObsDecayTime = 10.0f;
-    float kNewDecayTime = 2.0f;
-    int kDyObsThred = 4;
-    int KNewPointC = 10;
-    int kObsInflate = 2;
-    double systemStartTime = 0.0;
-    std::string worldFrameId = "map";
-    TimeMeasure Timer;
-
-#ifdef USE_PCL
-    PointCloudPtr surround_obs_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr surround_free_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr stack_new_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr cur_new_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr cur_dyobs_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr stack_dyobs_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr cur_scan_cloud = PointCloudPtr(new PointCloud());
-    PointCloudPtr local_terrain_obs = PointCloudPtr(new PointCloud());
-    PointCloudPtr local_terrain_free = PointCloudPtr(new PointCloud());
-    PointKdTreePtr kdtree_new_cloud = PointKdTreePtr(new pcl::KdTreeFLANN<PCLPoint>());
-    PointKdTreePtr kdtree_filter_cloud = PointKdTreePtr(new pcl::KdTreeFLANN<PCLPoint>());
-
-    // --- PCL utility methods ---
-    void FilterCloud(const PointCloudPtr& cloud, float leaf) {
-        pcl::VoxelGrid<PCLPoint> vg;
-        vg.setInputCloud(cloud);
-        vg.setLeafSize(leaf, leaf, leaf);
-        pcl::PointCloud<PCLPoint> filtered;
-        vg.filter(filtered);
-        *cloud = filtered;
+/// Convert dimos-lcm PointCloud2 to pcl::PointCloud<PCLPoint> via point_cloud_utils
+static PointCloudPtr lcm_pc2_to_pcl(const sensor_msgs::PointCloud2& lcm_msg) {
+    PointCloudPtr cloud(new pcl::PointCloud<PCLPoint>());
+    auto points = smart_nav::parse_pointcloud2(lcm_msg);
+    cloud->reserve(points.size());
+    for (const auto& p : points) {
+        PCLPoint pt;
+        pt.x = p.x;
+        pt.y = p.y;
+        pt.z = p.z;
+        pt.intensity = p.intensity;
+        cloud->push_back(pt);
     }
-    void CropPCLCloud(const PointCloudPtr& cloudIn, const PointCloudPtr& out,
-                      const Point3D& c, float range) {
-        out->clear();
-        out->resize(cloudIn->size());
-        std::size_t idx = 0;
-        for (const auto& p : cloudIn->points) {
-            if ((Point3D(p.x,p.y,p.z) - c).norm() < range) { out->points[idx++] = p; }
-        }
-        out->resize(idx);
-    }
-    PCLPoint Point3DToPCL(const Point3D& p) {
-        PCLPoint pp; pp.x=p.x; pp.y=p.y; pp.z=p.z; pp.intensity=p.intensity; return pp;
-    }
-    void ExtractNewObsPointCloud(const PointCloudPtr& cloudIn, const PointCloudPtr& refer, const PointCloudPtr& out) {
-        PointCloudPtr temp(new PointCloud());
-        for (auto& p : cloudIn->points) p.intensity = 0.0f;
-        for (auto& p : refer->points) p.intensity = 255.0f;
-        out->clear(); temp->clear();
-        *temp = *cloudIn + *refer;
-        FilterCloud(temp, kLeafSize*2.0f);
-        for (const auto& p : temp->points) {
-            if (p.intensity < kNewPIThred) out->points.push_back(p);
-        }
-    }
-    void ExtractFreeAndObsCloud(const PointCloudPtr& in, const PointCloudPtr& free_out, const PointCloudPtr& obs_out) {
-        free_out->clear(); obs_out->clear();
-        for (const auto& p : in->points) {
-            if (p.intensity < kFreeZ) free_out->points.push_back(p);
-            else obs_out->points.push_back(p);
-        }
-    }
-    void UpdateKdTrees(const PointCloudPtr& newObs) {
-        if (!newObs->empty()) kdtree_new_cloud->setInputCloud(newObs);
-        else {
-            PCLPoint tmp; tmp.x=tmp.y=tmp.z=0.f;
-            newObs->resize(1); newObs->points[0]=tmp;
-            kdtree_new_cloud->setInputCloud(newObs);
-        }
-    }
-    std::size_t PointInXCounter(const Point3D& p, float radius, const PointKdTreePtr& tree) {
-        std::vector<int> idx; std::vector<float> dist;
-        PCLPoint pp; pp.x=p.x; pp.y=p.y; pp.z=p.z;
-        if (!std::isfinite(pp.x) || !std::isfinite(pp.y) || !std::isfinite(pp.z)) return 0;
-        tree->radiusSearch(pp, radius, idx, dist);
-        return idx.size();
-    }
-    bool IsPointNearNewPoints(const Point3D& p, bool is_creation=false) {
-        int near_c = (int)PointInXCounter(p, kMatchDist, kdtree_new_cloud);
-        int limit = is_creation ? (int)std::round(KNewPointC/2.0f) : KNewPointC;
-        return near_c > limit;
-    }
-#endif
-
-    // --- Point-in-polygon (Randolph Franklin) ---
-    template <typename Point>
-    bool PointInsideAPoly(const std::vector<Point>& poly, const Point& p) const {
-        int i,j,c=0, npol=(int)poly.size();
-        if (npol<3) return false;
-        for (i=0,j=npol-1; i<npol; j=i++) {
-            if ((((poly[i].y<=p.y)&&(p.y<poly[j].y))||((poly[j].y<=p.y)&&(p.y<poly[i].y)))&&
-                (p.x<(poly[j].x-poly[i].x)*(p.y-poly[i].y)/(poly[j].y-poly[i].y)+poly[i].x)) c=!c;
-        }
-        return c;
-    }
-
-    bool IsPointInToleratedHeight(const Point3D& p, float h) const {
-        return fabs(p.z - robot_pos.z) < h;
-    }
-    bool IsPointInLocalRange(const Point3D& p, bool large_h=false) const {
-        float H = large_h ? kTolerZ+kHeightVoxel : kTolerZ;
-        return IsPointInToleratedHeight(p, H) && (p-odom_pos).norm() < kSensorRange;
-    }
-    bool IsPointInMarginRange(const Point3D& p) const {
-        return IsPointInToleratedHeight(p, kMarginHeight) && (p-odom_pos).norm() < kMarginDist;
-    }
-    bool IsFreeNavNode(const NavNodePtr& n) const { return n->is_odom || n->is_navpoint; }
-    bool IsStaticNode(const NavNodePtr& n) const { return n->is_odom || n->is_goal; }
-    bool IsOutsideGoal(const NavNodePtr& n) const { return n->is_goal && !n->is_navpoint; }
-    int Mod(int a, int b) const { return (b+(a%b))%b; }
-    bool IsSamePoint3D(const Point3D& p1, const Point3D& p2) const { return (p2-p1).norm()<kEpsilon; }
-
-    void EraseNodeFromStack(const NavNodePtr& n, NodePtrStack& stack) {
-        for (auto it=stack.begin(); it!=stack.end();) {
-            if (*it==n) it=stack.erase(it); else ++it;
-        }
-    }
-    template <typename T>
-    bool IsTypeInStack(const T& e, const std::vector<T>& s) const {
-        return std::find(s.begin(), s.end(), e) != s.end();
-    }
-    float NoiseCosValue(float dot_val, bool is_large, float noise) const {
-        float theta = std::acos(std::max(-1.0f, std::min(1.0f, dot_val)));
-        int sign = is_large ? 1 : -1;
-        double m = theta + sign*noise;
-        m = std::min(std::max(m, 0.0), (double)M_PI);
-        return (float)cos(m);
-    }
-    float MarginAngleNoise(float dist, float max_shift, float angle_noise) const {
-        float m = angle_noise;
-        if (dist*sin(m) < max_shift) m = std::asin(max_shift/std::max(dist, max_shift));
-        return m;
-    }
-    bool IsOutReducedDirs(const Point3D& diff, const PointPair& dirs) const {
-        Point3D nd = diff.normalize_flat();
-        float man = MarginAngleNoise(diff.norm_flat(), kNearDist, kAngleNoise);
-        Point3D opp = -dirs.second;
-        float thrd = NoiseCosValue(dirs.first*opp, true, man);
-        if (nd*dirs.first>thrd && nd*opp>thrd) return true;
-        opp = -dirs.first;
-        thrd = NoiseCosValue(dirs.second*opp, true, man);
-        if (nd*dirs.second>thrd && nd*opp>thrd) return true;
-        return false;
-    }
-    bool IsOutReducedDirs(const Point3D& diff, const NavNodePtr& n) const {
-        if (n->free_direct != PILLAR) { if (!IsOutReducedDirs(diff, n->surf_dirs)) return false; }
-        return true;
-    }
-    Point3D SurfTopoDirect(const PointPair& dirs) const {
-        Point3D td = dirs.first + dirs.second;
-        return (td.norm_flat() > kEpsilon) ? td.normalize_flat() : Point3D(0,0,0);
-    }
-    bool IsVoteTrue(const std::deque<int>& votes, bool balanced=true) const {
-        int N=(int)votes.size();
-        float s = std::accumulate(votes.begin(), votes.end(), 0.0f);
-        float f = balanced ? 2.0f : 3.0f;
-        return s > std::floor(N/f);
-    }
-    bool IsConvexPoint(const PolygonPtr& poly, const Point3D& ev_p) const {
-        return PointInsideAPoly(poly->vertices, ev_p) != poly->is_robot_inside;
-    }
-    template <typename N1, typename N2>
-    bool IsAtSameLayer(const N1& n1, const N2& n2) const {
-        if (is_multi_layer && fabs(n1->position.z - n2->position.z) > kTolerZ) return false;
-        return true;
-    }
-    bool IsNodeInLocalRange(const NavNodePtr& n, bool lh=false) const { return IsPointInLocalRange(n->position, lh); }
-    bool IsNodeInExtendMatchRange(const NavNodePtr& n) const {
-        return IsPointInToleratedHeight(n->position, kTolerZ*1.5f) && (n->position-odom_pos).norm()<kSensorRange;
-    }
-    float ClampAbsRange(float v, float range) const { range=fabs(range); return std::min(std::max(-range,v),range); }
-    float ContourSurfDirs(const Point3D& end_p, const Point3D& start_p, const Point3D& center_p, float radius) const {
-        // Returns direction angle; simplified for the port
-        float D = (center_p - end_p).norm_flat();
-        float phi = std::acos((center_p-end_p).norm_flat_dot(start_p-end_p));
-        float H = D*sin(phi);
-        if (H < kEpsilon) return 0;
-        return std::asin(ClampAbsRange(H/radius, 1.0f));
-    }
-    Point3D ContourSurfDirsVec(const Point3D& end_p, const Point3D& start_p, const Point3D& center_p, float radius) const {
-        float D = (center_p - end_p).norm_flat();
-        float phi = std::acos((center_p-end_p).norm_flat_dot(start_p-end_p));
-        float H = D*sin(phi);
-        if (H < kEpsilon) return (end_p - center_p).normalize_flat();
-        float theta = asin(ClampAbsRange(H/radius, 1.0f));
-        Point3D dir = (start_p - end_p).normalize_flat();
-        Point3D V_p = end_p + dir * D * cos(phi);
-        Point3D K_p = V_p - dir * radius * cos(theta);
-        return (K_p - center_p).normalize_flat();
-    }
-    bool IsInCoverageDirPairs(const Point3D& diff, const NavNodePtr& n) const {
-        if (n->free_direct == PILLAR) return false;
-        Point3D nd = diff.normalize_flat();
-        float man = MarginAngleNoise(diff.norm_flat(), kNearDist, kAngleNoise*2.0f);
-        float dv = NoiseCosValue(n->surf_dirs.first * n->surf_dirs.second, true, man);
-        if (n->free_direct == CONCAVE) {
-            if (nd*n->surf_dirs.first>dv && nd*n->surf_dirs.second>dv) return true;
-        } else if (n->free_direct == CONVEX) {
-            if (nd*(-n->surf_dirs.second)>dv && nd*(-n->surf_dirs.first)>dv) return true;
-        }
-        return false;
-    }
-    bool IsInContourDirPairs(const Point3D& diff, const PointPair& dirs) const {
-        float man = MarginAngleNoise(diff.norm_flat(), kNearDist, kAngleNoise);
-        float mc = cos(man);
-        if (dirs.first.norm_dot(diff) > mc) return true;
-        if (dirs.second.norm_dot(diff) > mc) return true;
-        return false;
-    }
-    float VerticalDistToLine2D(const Point3D& sp, const Point3D& ep, const Point3D& cp) const {
-        Point3D ld = ep - sp;
-        Point3D dp = cp - sp;
-        float dv = ld.norm_flat_dot(dp);
-        return sin(acos(dv)) * dp.norm_flat();
-    }
-    bool IsInCylinder(const Point3D& from, const Point3D& to, const Point3D& cur, float radius, bool is2d=false) const {
-        Point3D ua = is2d ? (to-from).normalize_flat() : (to-from).normalize();
-        Point3D v = cur - from;
-        float ps = v * ua;
-        float tl = is2d ? (to-from).norm_flat() : (to-from).norm();
-        if (ps < -radius || ps > tl+radius) return false;
-        Point3D va = ua * ps;
-        float dl = is2d ? (v-va).norm_flat() : (v-va).norm();
-        return dl <= radius;
-    }
-    float DistanceToLineSeg2D(const Point3D& p, const PointPair& line) const {
-        float A=(p-line.first).x, B=(p-line.first).y;
-        float C=(line.second-line.first).x, D=(line.second-line.first).y;
-        float dot=A*C+B*D, len_sq=C*C+D*D;
-        float param = (len_sq!=0.0f) ? dot/len_sq : -1.0f;
-        float xx,yy;
-        if (param<0) { xx=line.first.x; yy=line.first.y; }
-        else if (param>1) { xx=line.second.x; yy=line.second.y; }
-        else { xx=line.first.x+param*C; yy=line.first.y+param*D; }
-        return sqrt((p.x-xx)*(p.x-xx)+(p.y-yy)*(p.y-yy));
-    }
-    float LineMatchPercentage(const PointPair& l1, const PointPair& l2) const {
-        float ds = (l1.first-l2.first).norm_flat();
-        float theta = acos((l1.second-l1.first).norm_flat_dot(l2.second-l2.first));
-        if (theta > kAcceptAlign || ds > kNavClearDist) return 0.0f;
-        float cds = (l2.second-l2.first).norm_flat();
-        float mds = cds;
-        if (theta > kEpsilon) mds = std::min(mds, kNavClearDist/tan(theta));
-        return mds/cds;
-    }
-    int VoteRankInVotes(int c, const std::vector<int>& ov) const {
-        int idx=0;
-        while (idx<(int)ov.size() && c<ov[idx]) idx++;
-        return idx;
-    }
-    float DirsDistance(const PointPair& r, const PointPair& c) const {
-        return std::acos(r.first.norm_dot(c.first)) + std::acos(r.second.norm_dot(c.second));
-    }
-    Point3D RANSACPosition(const std::deque<Point3D>& pf, float margin, std::size_t& inlier_sz) const {
-        inlier_sz = 0;
-        PointStack best;
-        for (const auto& p : pf) {
-            PointStack tmp;
-            for (const auto& cp : pf) { if ((p-cp).norm_flat()<margin) tmp.push_back(cp); }
-            if (tmp.size()>inlier_sz) { best=tmp; inlier_sz=tmp.size(); }
-        }
-        return AveragePoints(best);
-    }
-    Point3D AveragePoints(const PointStack& ps) const {
-        Point3D m(0,0,0);
-        if (ps.empty()) return m;
-        for (const auto& p : ps) m = m + p;
-        return m / (float)ps.size();
-    }
-    PointPair RANSACSurfDirs(const std::deque<PointPair>& sd, float margin, std::size_t& isz) const {
-        isz = 0;
-        std::vector<PointPair> best;
-        PointPair pillar_dir(Point3D(0,0,-1), Point3D(0,0,-1));
-        std::size_t pc = 0;
-        for (const auto& d : sd) if (d.first==Point3D(0,0,-1)&&d.second==Point3D(0,0,-1)) pc++;
-        for (const auto& d : sd) {
-            if (d.first==Point3D(0,0,-1)&&d.second==Point3D(0,0,-1)) continue;
-            std::vector<PointPair> tmp;
-            for (const auto& cd : sd) {
-                if (cd.first==Point3D(0,0,-1)&&cd.second==Point3D(0,0,-1)) continue;
-                if (DirsDistance(d,cd)<margin) tmp.push_back(cd);
-            }
-            if (tmp.size()>isz) { best=tmp; isz=tmp.size(); }
-        }
-        if (pc>isz) { isz=pc; return pillar_dir; }
-        // average dirs
-        Point3D m1(0,0,0), m2(0,0,0);
-        for (const auto& d : best) { m1=m1+d.first; m2=m2+d.second; }
-        return {m1.normalize(), m2.normalize()};
-    }
-    void CorrectDirectOrder(const PointPair& ref, PointPair& d) const {
-        if (ref.first*d.first + ref.second*d.second < ref.first*d.second + ref.second*d.first)
-            std::swap(d.first, d.second);
-    }
-};
-
-// Global instance
-static FARGlobals G;
-
-// ---------------------------------------------------------------------------
-//  Graph ID tracker and global graph storage
-// ---------------------------------------------------------------------------
-static std::size_t g_id_tracker = 1;
-static NodePtrStack g_global_graph_nodes;
-static std::unordered_map<std::size_t, NavNodePtr> g_idx_node_map;
-
-// Contour graph global statics
-static CTNodeStack g_contour_graph;
-static PolygonStack g_contour_polygons;
-static CTNodeStack g_polys_ctnodes;
-static std::vector<PointPair> g_global_contour;
-static std::vector<PointPair> g_boundary_contour;
-static std::vector<PointPair> g_local_boundary;
-static std::vector<PointPair> g_inactive_contour;
-static std::vector<PointPair> g_unmatched_contour;
-static std::unordered_set<NavEdge, navedge_hash> g_global_contour_set;
-static std::unordered_set<NavEdge, navedge_hash> g_boundary_contour_set;
-
-// ---------------------------------------------------------------------------
-//  CreateNavNodeFromPoint — factory for navigation nodes
-// ---------------------------------------------------------------------------
-static void AssignGlobalNodeID(const NavNodePtr& n) {
-    n->id = g_id_tracker;
-    g_idx_node_map.insert({n->id, n});
-    g_id_tracker++;
+    cloud->width = static_cast<uint32_t>(cloud->size());
+    cloud->height = 1;
+    cloud->is_dense = true;
+    return cloud;
 }
 
-static void CreateNavNodeFromPoint(const Point3D& p, NavNodePtr& n, bool is_odom,
-                                   bool is_navpoint=false, bool is_goal=false, bool is_boundary=false) {
-    n = std::make_shared<NavNode>();
-    n->pos_filter_vec.clear();
-    n->surf_dirs_vec.clear();
-    n->ctnode = nullptr;
-    n->is_active = true;
-    n->is_block_frontier = false;
-    n->is_contour_match = false;
-    n->is_odom = is_odom;
-    n->is_near_nodes = true;
-    n->is_wide_near = true;
-    n->is_merged = false;
-    n->is_covered = (is_odom||is_navpoint||is_goal);
-    n->is_frontier = false;
-    n->is_finalized = is_navpoint;
-    n->is_traversable = is_odom;
-    n->is_navpoint = is_navpoint;
-    n->is_boundary = is_boundary;
-    n->is_goal = is_goal;
-    n->clear_dumper_count = 0;
-    n->frontier_votes.clear();
-    n->invalid_boundary.clear();
-    n->connect_nodes.clear();
-    n->poly_connects.clear();
-    n->contour_connects.clear();
-    n->contour_votes.clear();
-    n->potential_contours.clear();
-    n->trajectory_connects.clear();
-    n->trajectory_votes.clear();
-    n->terrain_votes.clear();
-    n->free_direct = (is_odom||is_navpoint) ? PILLAR : UNKNOW;
-    n->is_block_to_goal = false;
-    n->gscore = G.kINF;
-    n->fgscore = G.kINF;
-    n->is_traversable = true;
-    n->is_free_traversable = true;
-    n->parent = nullptr;
-    n->free_parent = nullptr;
-    n->position = p;
-    n->pos_filter_vec.push_back(p);
-    AssignGlobalNodeID(n);
+/// Convert Point3D to dimos-lcm geometry_msgs::PointStamped
+static geometry_msgs::PointStamped point3d_to_lcm_point_stamped(
+    const Point3D& pt, double timestamp) {
+    geometry_msgs::PointStamped msg;
+    msg.header = dimos::make_header(g_world_frame, timestamp);
+    msg.point.x = pt.x;
+    msg.point.y = pt.y;
+    msg.point.z = pt.z;
+    return msg;
+}
+
+/// Convert a path (vector of NavNodePtr) to dimos-lcm nav_msgs::Path
+static nav_msgs::Path path_to_lcm_path(
+    const NodePtrStack& path_nodes, double timestamp) {
+    nav_msgs::Path msg;
+    msg.header = dimos::make_header(g_world_frame, timestamp);
+    msg.poses_length = static_cast<int32_t>(path_nodes.size());
+    msg.poses.resize(path_nodes.size());
+    for (size_t i = 0; i < path_nodes.size(); ++i) {
+        auto& pose = msg.poses[i];
+        pose.header = msg.header;
+        pose.pose.position.x = path_nodes[i]->position.x;
+        pose.pose.position.y = path_nodes[i]->position.y;
+        pose.pose.position.z = path_nodes[i]->position.z;
+        pose.pose.orientation.w = 1.0;
+    }
+    return msg;
+}
+
+/// Extract robot position from odometry message
+static Point3D odom_to_point3d(const nav_msgs::Odometry& odom) {
+    return Point3D(
+        static_cast<float>(odom.pose.pose.position.x),
+        static_cast<float>(odom.pose.pose.position.y),
+        static_cast<float>(odom.pose.pose.position.z));
 }
 
 // ---------------------------------------------------------------------------
-//  Graph edge helpers
+// Signal handling
 // ---------------------------------------------------------------------------
-static void AddEdge(const NavNodePtr& n1, const NavNodePtr& n2) {
-    if (n1==n2) return;
-    if (!G.IsTypeInStack(n2, n1->connect_nodes) && !G.IsTypeInStack(n1, n2->connect_nodes)) {
-        n1->connect_nodes.push_back(n2);
-        n2->connect_nodes.push_back(n1);
-    }
-}
-static void EraseEdge(const NavNodePtr& n1, const NavNodePtr& n2) {
-    G.EraseNodeFromStack(n2, n1->connect_nodes);
-    G.EraseNodeFromStack(n1, n2->connect_nodes);
-}
-static void AddPolyEdge(const NavNodePtr& n1, const NavNodePtr& n2) {
-    if (n1==n2) return;
-    if (!G.IsTypeInStack(n2, n1->poly_connects) && !G.IsTypeInStack(n1, n2->poly_connects)) {
-        n1->poly_connects.push_back(n2);
-        n2->poly_connects.push_back(n1);
-    }
-}
-static void ErasePolyEdge(const NavNodePtr& n1, const NavNodePtr& n2) {
-    G.EraseNodeFromStack(n2, n1->poly_connects);
-    G.EraseNodeFromStack(n1, n2->poly_connects);
-}
-static void AddNodeToGraph(const NavNodePtr& n) {
-    if (n) g_global_graph_nodes.push_back(n);
+
+static void signal_handler(int /*sig*/) {
+    g_running.store(false);
 }
 
 // ---------------------------------------------------------------------------
-//  Contour graph helpers — add/delete contour to sets
+// Waypoint projection: push waypoints away from obstacle surfaces
+// Based on Algorithm 6 (Figure 14) from the FPS paper.
 // ---------------------------------------------------------------------------
-static void AddContourToSets(const NavNodePtr& n1, const NavNodePtr& n2) {
-    NavEdge e = (n1->id < n2->id) ? NavEdge(n1,n2) : NavEdge(n2,n1);
-    g_global_contour_set.insert(e);
-    if (n1->is_boundary && n2->is_boundary) g_boundary_contour_set.insert(e);
-}
-static void DeleteContourFromSets(const NavNodePtr& n1, const NavNodePtr& n2) {
-    NavEdge e = (n1->id < n2->id) ? NavEdge(n1,n2) : NavEdge(n2,n1);
-    g_global_contour_set.erase(e);
-    if (n1->is_boundary && n2->is_boundary) g_boundary_contour_set.erase(e);
-}
-static void AddContourConnect(const NavNodePtr& n1, const NavNodePtr& n2) {
-    if (!G.IsTypeInStack(n1, n2->contour_connects) && !G.IsTypeInStack(n2, n1->contour_connects)) {
-        n1->contour_connects.push_back(n2);
-        n2->contour_connects.push_back(n1);
-        AddContourToSets(n1, n2);
-    }
-}
 
-// ---------------------------------------------------------------------------
-//  Collision checking with boundary segments
-// ---------------------------------------------------------------------------
-#ifdef HAS_OPENCV
-static bool IsEdgeCollideSegment(const PointPair& line, const ConnectPair& edge) {
-    cv::Point2f sp(line.first.x, line.first.y), ep(line.second.x, line.second.y);
-    return POLYOPS::doIntersect(sp, ep, edge.start_p, edge.end_p);
-}
-static bool IsEdgeCollidePoly(const PointStack& poly, const ConnectPair& edge) {
-    int N=(int)poly.size();
-    for (int i=0; i<N; i++) {
-        PointPair l(poly[i], poly[G.Mod(i+1,N)]);
-        if (IsEdgeCollideSegment(l, edge)) return true;
-    }
-    return false;
-}
-static bool IsNavNodesConnectFreePolygon(const NavNodePtr& n1, const NavNodePtr& n2) {
-    // simplified check against boundary contours
-    ConnectPair cedge(n1->position, n2->position);
-    HeightPair hp(n1->position, n2->position);
-    for (const auto& c : g_boundary_contour) {
-        if (IsEdgeCollideSegment(c, cedge)) return false;
-    }
-    for (const auto& poly : g_contour_polygons) {
-        if (poly->is_pillar) continue;
-        if (IsEdgeCollidePoly(poly->vertices, cedge)) return false;
-    }
-    return true;
-}
-#else
-// Without OpenCV, provide stub that always returns true
-static bool IsNavNodesConnectFreePolygon(const NavNodePtr&, const NavNodePtr&) { return true; }
-#endif
+/// Project a nav waypoint away from obstacle surfaces into free space.
+/// Uses the node's surf_dirs to determine the "away from wall" direction,
+/// then ray-traces along that direction using the obstacle cloud to find
+/// how far the waypoint can be extended.
+/// Project waypoint away from obstacle surfaces (Algorithm 6 / Figure 14).
+/// Updates free_dist in-place with actual achieved distance (for heading momentum).
+static Point3D ProjectWaypointFromObstacles(
+    const NavNodePtr& nav_node,
+    const Point3D& robot_position,
+    float& free_dist)
+{
+    if (nav_node == nullptr) return Point3D(0,0,0);
 
-// ---------------------------------------------------------------------------
-//  Dijkstra-based traversability + A* path planning
-//  (Port of graph_planner.cpp)
-// ---------------------------------------------------------------------------
-struct GraphPlanner {
-    NavNodePtr odom_node = nullptr;
-    NavNodePtr goal_node = nullptr;
-    Point3D origin_goal_pos;
-    bool is_goal_init = false;
-    bool is_use_internav_goal = false;
-    bool is_global_path_init = false;
-    float converge_dist = 1.0f;
-    NodePtrStack current_graph;
-    NodePtrStack recorded_path;
-    Point3D next_waypoint;
-    int path_momentum_counter = 0;
-    int momentum_thred = 5;
+    Point3D waypoint = nav_node->position;
 
-    void UpdateGraphTraverability(const NavNodePtr& odom, const NavNodePtr& goal_ptr) {
-        if (!odom || current_graph.empty()) return;
-        odom_node = odom;
-        // Init all node states
-        for (auto& n : current_graph) {
-            n->gscore = G.kINF; n->fgscore = G.kINF;
-            n->is_traversable = false; n->is_free_traversable = false;
-            n->parent = nullptr; n->free_parent = nullptr;
-        }
-        // Dijkstra from odom
-        odom_node->gscore = 0.0f;
-        IdxSet open_set, close_set;
-        std::priority_queue<NavNodePtr, NodePtrStack, nodeptr_gcomp> oq;
-        oq.push(odom_node); open_set.insert(odom_node->id);
-        while (!open_set.empty()) {
-            auto cur = oq.top(); oq.pop();
-            open_set.erase(cur->id); close_set.insert(cur->id);
-            cur->is_traversable = true;
-            for (const auto& nb : cur->connect_nodes) {
-                if (close_set.count(nb->id)) continue;
-                float ed = (cur->position - nb->position).norm();
-                float tg = cur->gscore + ed;
-                if (tg < nb->gscore) {
-                    nb->parent = cur; nb->gscore = tg;
-                    if (!open_set.count(nb->id)) { oq.push(nb); open_set.insert(nb->id); }
-                }
-            }
-        }
-        // Free-space expansion
-        odom_node->fgscore = 0.0f;
-        IdxSet fopen, fclose;
-        std::priority_queue<NavNodePtr, NodePtrStack, nodeptr_fgcomp> fq;
-        fq.push(odom_node); fopen.insert(odom_node->id);
-        while (!fopen.empty()) {
-            auto cur = fq.top(); fq.pop();
-            fopen.erase(cur->id); fclose.insert(cur->id);
-            cur->is_free_traversable = true;
-            for (const auto& nb : cur->connect_nodes) {
-                if (!nb->is_covered || fclose.count(nb->id)) continue;
-                float ed = (cur->position - nb->position).norm();
-                float tfg = cur->fgscore + ed;
-                if (tfg < nb->fgscore) {
-                    nb->free_parent = cur; nb->fgscore = tfg;
-                    if (!fopen.count(nb->id)) { fq.push(nb); fopen.insert(nb->id); }
-                }
-            }
+    // Only project CONVEX nodes (nodes on obstacle corners that face outward)
+    // For non-CONVEX nodes, set free_dist to 0 so heading extension is minimal
+    if (nav_node->free_direct != NodeFreeDirect::CONVEX) { free_dist = 0; return waypoint; }
+    if (FARUtil::surround_obs_cloud_ == nullptr || FARUtil::surround_obs_cloud_->empty()) return waypoint;
+
+    // Compute surface normal direction (away from obstacle)
+    bool is_wall = false;
+    const Point3D surf_dir = -FARUtil::SurfTopoDirect(nav_node->surf_dirs, is_wall);
+    if (is_wall || surf_dir.norm() < FARUtil::kEpsilon) { free_dist = 0; return waypoint; }
+
+    // Crop obstacle cloud around the waypoint (matches original ExtendViewpointOnObsCloud)
+    PointCloudPtr local_obs(new pcl::PointCloud<PCLPoint>());
+    FARUtil::CropPCLCloud(FARUtil::surround_obs_cloud_, local_obs,
+                          nav_node->position, free_dist + FARUtil::kNearDist);
+
+    float maxR = std::min((nav_node->position - robot_position).norm(), free_dist) - FARUtil::kNearDist;
+    maxR = std::max(maxR, 0.0f);
+
+    if (local_obs->empty()) {
+        waypoint = waypoint + surf_dir * maxR;
+        free_dist = maxR;
+        return waypoint;
+    }
+
+    // Build KD-tree from cropped surround obs (matches original kdtree_viewpoint_obs_cloud_)
+    PointKdTreePtr local_kdtree(new pcl::KdTreeFLANN<PCLPoint>());
+    local_kdtree->setInputCloud(local_obs);
+
+    const float step = FARUtil::kNearDist;
+    const float collision_radius = FARUtil::kNearDist / 2.0f + FARUtil::kLeafSize;
+    const int collision_threshold = static_cast<int>(std::floor(FARUtil::kNearDist / FARUtil::kLeafSize));
+
+    // Ray-trace outward from the node along surf_dir (matches original ray tracing)
+    Point3D start_p = waypoint + surf_dir * step;
+    float ray_dist = step;
+    bool is_occupied = static_cast<int>(FARUtil::PointInXCounter(start_p, collision_radius, local_kdtree)) > collision_threshold;
+    waypoint = start_p;
+
+    while (!is_occupied && ray_dist < free_dist) {
+        start_p = start_p + surf_dir * step;
+        ray_dist += step;
+        is_occupied = static_cast<int>(FARUtil::PointInXCounter(start_p, collision_radius, local_kdtree)) > collision_threshold;
+        if (ray_dist < maxR) {
+            waypoint = start_p;
         }
     }
 
-    void UpdateGoalConnects(const NavNodePtr& goal_ptr) {
-        if (!goal_ptr || is_use_internav_goal) return;
-        for (const auto& n : current_graph) {
-            if (n == goal_ptr) continue;
-            if (n->is_traversable && IsNavNodesConnectFreePolygon(n, goal_ptr)) {
-                AddPolyEdge(n, goal_ptr); AddEdge(n, goal_ptr);
-                n->is_block_to_goal = false;
-            } else {
-                ErasePolyEdge(n, goal_ptr); EraseEdge(n, goal_ptr);
-                n->is_block_to_goal = true;
-            }
-        }
+    if (is_occupied) {
+        waypoint = (nav_node->position + waypoint - surf_dir * step) / 2.0f;
+        waypoint.z = nav_node->position.z;
+        free_dist = ray_dist - step;
+    } else {
+        // Full extension without hitting obstacle — free_dist = actual distance extended
+        free_dist = (waypoint - nav_node->position).norm();
     }
 
-    bool ReconstructPath(const NavNodePtr& goal_ptr, NodePtrStack& path) {
-        if (!goal_ptr || !goal_ptr->parent) return false;
-        path.clear();
-        NavNodePtr c = goal_ptr;
-        path.push_back(c);
-        while (c->parent) { path.push_back(c->parent); c = c->parent; }
-        std::reverse(path.begin(), path.end());
-        return true;
-    }
-
-    NavNodePtr NextWaypoint(const NodePtrStack& path, const NavNodePtr& goal_ptr) {
-        if (path.size()<2) return goal_ptr;
-        std::size_t idx = 1;
-        NavNodePtr wp = path[idx];
-        float dist = (wp->position - odom_node->position).norm();
-        while (dist < converge_dist && idx+1 < path.size()) {
-            idx++; wp = path[idx];
-            dist = (wp->position - odom_node->position).norm();
-        }
-        return wp;
-    }
-
-    void UpdateGoal(const Point3D& goal) {
-        GoalReset();
-        is_use_internav_goal = false;
-        // Check if near an existing internav node
-        float min_dist = G.kNearDist;
-        for (const auto& n : current_graph) {
-            if (n->is_navpoint) {
-                float d = (n->position - goal).norm();
-                if (d < min_dist) {
-                    is_use_internav_goal = true;
-                    goal_node = n;
-                    min_dist = d;
-                    goal_node->is_goal = true;
-                }
-            }
-        }
-        if (!is_use_internav_goal) {
-            CreateNavNodeFromPoint(goal, goal_node, false, false, true);
-            AddNodeToGraph(goal_node);
-        }
-        is_goal_init = true;
-        is_global_path_init = false;
-        origin_goal_pos = goal_node->position;
-        path_momentum_counter = 0;
-        recorded_path.clear();
-        printf("[FAR] New goal set at (%.2f, %.2f, %.2f)\n", goal.x, goal.y, goal.z);
-    }
-
-    bool PathToGoal(const NavNodePtr& goal_ptr, NodePtrStack& global_path,
-                    NavNodePtr& nav_wp, Point3D& goal_p,
-                    bool& is_fail, bool& is_succeed) {
-        if (!is_goal_init || !odom_node || !goal_ptr || current_graph.empty()) return false;
-        is_fail = false; is_succeed = false;
-        global_path.clear();
-        goal_p = goal_ptr->position;
-
-        if ((odom_node->position - goal_p).norm() < converge_dist ||
-            (odom_node->position - origin_goal_pos).norm() < converge_dist) {
-            is_succeed = true;
-            global_path.push_back(odom_node);
-            global_path.push_back(goal_ptr);
-            nav_wp = goal_ptr;
-            GoalReset();
-            is_goal_init = false;
-            printf("[FAR] *** Goal Reached! ***\n");
-            return true;
-        }
-
-        if (goal_ptr->parent) {
-            NodePtrStack path;
-            if (ReconstructPath(goal_ptr, path)) {
-                nav_wp = NextWaypoint(path, goal_ptr);
-                global_path = path;
-                recorded_path = path;
-                is_global_path_init = true;
-                return true;
-            }
-        }
-        // No path found
-        if (is_global_path_init && path_momentum_counter < momentum_thred) {
-            global_path = recorded_path;
-            nav_wp = NextWaypoint(global_path, goal_ptr);
-            path_momentum_counter++;
-            return true;
-        }
-        // Don't reset the goal — keep it alive so we can retry once the
-        // visibility graph grows (robot needs to move first).
-        is_fail = true;
-        return false;
-    }
-
-    void GoalReset() {
-        if (goal_node && !is_use_internav_goal) {
-            // Remove goal from graph
-            for (auto& cn : goal_node->connect_nodes) G.EraseNodeFromStack(goal_node, cn->connect_nodes);
-            for (auto& pn : goal_node->poly_connects) G.EraseNodeFromStack(goal_node, pn->poly_connects);
-            goal_node->connect_nodes.clear();
-            goal_node->poly_connects.clear();
-            G.EraseNodeFromStack(goal_node, g_global_graph_nodes);
-        } else if (goal_node) {
-            goal_node->is_goal = false;
-        }
-        goal_node = nullptr;
-    }
-};
-
-// ---------------------------------------------------------------------------
-//  Dynamic graph manager — simplified
-//  (Core of dynamic_graph.h / dynamic_graph.cpp)
-// ---------------------------------------------------------------------------
-struct DynamicGraphManager {
-    NavNodePtr odom_node = nullptr;
-    NavNodePtr cur_internav = nullptr;
-    NavNodePtr last_internav = nullptr;
-    NodePtrStack near_nav_nodes, wide_near_nodes, extend_match_nodes;
-    NodePtrStack new_nodes;
-    Point3D last_connect_pos;
-    int finalize_thred = 3;
-    int votes_size = 10;
-    int dumper_thred = 3;
-
-    void UpdateRobotPosition(const Point3D& rp) {
-        if (!odom_node) {
-            CreateNavNodeFromPoint(rp, odom_node, true);
-            AddNodeToGraph(odom_node);
-        } else {
-            odom_node->position = rp;
-            odom_node->pos_filter_vec.clear();
-            odom_node->pos_filter_vec.push_back(rp);
-        }
-        G.odom_pos = odom_node->position;
-    }
-
-    void UpdateGlobalNearNodes() {
-        near_nav_nodes.clear(); wide_near_nodes.clear(); extend_match_nodes.clear();
-        for (auto& n : g_global_graph_nodes) {
-            n->is_near_nodes = false; n->is_wide_near = false;
-            if (G.IsNodeInExtendMatchRange(n)) {
-                if (G.IsOutsideGoal(n)) continue;
-                extend_match_nodes.push_back(n);
-                if (G.IsNodeInLocalRange(n)) {
-                    wide_near_nodes.push_back(n); n->is_wide_near = true;
-                    if (n->is_active || n->is_boundary) {
-                        near_nav_nodes.push_back(n); n->is_near_nodes = true;
-                    }
-                }
-            }
-        }
-    }
-
-    bool ExtractGraphNodes() {
-        new_nodes.clear();
-        // Check if we need a trajectory waypoint
-        if (!cur_internav || (G.free_odom_p - last_connect_pos).norm() > G.kNearDist) {
-            NavNodePtr np;
-            CreateNavNodeFromPoint(G.free_odom_p, np, false, true);
-            new_nodes.push_back(np);
-            last_connect_pos = G.free_odom_p;
-            if (!cur_internav) cur_internav = np;
-            last_internav = cur_internav;
-            cur_internav = np;
-        }
-        return !new_nodes.empty();
-    }
-
-    void UpdateNavGraph(const NodePtrStack& new_nodes_in, bool is_freeze) {
-        if (is_freeze) return;
-        // Add new nodes
-        for (const auto& nn : new_nodes_in) {
-            AddNodeToGraph(nn);
-            nn->is_near_nodes = true;
-            near_nav_nodes.push_back(nn);
-        }
-        // Build visibility edges between odom and near nodes
-        for (const auto& n : wide_near_nodes) {
-            if (n->is_odom) continue;
-            if (IsNavNodesConnectFreePolygon(odom_node, n)) {
-                AddPolyEdge(odom_node, n); AddEdge(odom_node, n);
-            } else {
-                ErasePolyEdge(odom_node, n); EraseEdge(odom_node, n);
-            }
-        }
-        // Connect near nodes to each other
-        for (std::size_t i=0; i<near_nav_nodes.size(); i++) {
-            auto n1 = near_nav_nodes[i];
-            if (n1->is_odom) continue;
-            for (std::size_t j=i+1; j<near_nav_nodes.size(); j++) {
-                auto n2 = near_nav_nodes[j];
-                if (n2->is_odom) continue;
-                if (IsNavNodesConnectFreePolygon(n1, n2)) {
-                    AddPolyEdge(n1, n2); AddEdge(n1, n2);
-                } else {
-                    ErasePolyEdge(n1, n2); EraseEdge(n1, n2);
-                }
-            }
-        }
-    }
-
-    const NodePtrStack& GetNavGraph() const { return g_global_graph_nodes; }
-    NavNodePtr GetOdomNode() const { return odom_node; }
-
-    void ResetCurrentGraph() {
-        odom_node = nullptr; cur_internav = nullptr; last_internav = nullptr;
-        g_id_tracker = 1;
-        g_idx_node_map.clear();
-        near_nav_nodes.clear(); wide_near_nodes.clear(); extend_match_nodes.clear();
-        new_nodes.clear();
-        g_global_graph_nodes.clear();
-    }
-};
-
-// ---------------------------------------------------------------------------
-//  Contour detector — simplified OpenCV contour extraction
-//  (Port of contour_detector.cpp — only built with HAS_OPENCV)
-// ---------------------------------------------------------------------------
-#ifdef HAS_OPENCV
-struct ContourDetector {
-    float sensor_range = 30.0f;
-    float voxel_dim = 0.2f;
-    float kRatio = 5.0f;
-    int kThredValue = 5;
-    int kBlurSize = 3;
-    int MAT_SIZE, CMAT, MAT_RESIZE, CMAT_RESIZE;
-    float DIST_LIMIT, ALIGN_ANGLE_COS, VOXEL_DIM_INV;
-    Point3D odom_pos;
-    cv::Mat img_mat;
-    std::vector<std::vector<cv::Point2f>> refined_contours;
-    std::vector<cv::Vec4i> refined_hierarchy;
-
-    void Init() {
-        MAT_SIZE = (int)std::ceil(sensor_range*2.0f/voxel_dim);
-        if (MAT_SIZE%2==0) MAT_SIZE++;
-        MAT_RESIZE = MAT_SIZE*(int)kRatio;
-        CMAT = MAT_SIZE/2; CMAT_RESIZE = MAT_RESIZE/2;
-        img_mat = cv::Mat::zeros(MAT_SIZE, MAT_SIZE, CV_32FC1);
-        DIST_LIMIT = kRatio * 1.2f;
-        ALIGN_ANGLE_COS = cos(G.kAcceptAlign/2.0f);
-        VOXEL_DIM_INV = 1.0f/voxel_dim;
-    }
-
-    void PointToImgSub(const Point3D& p, int& row, int& col, bool resized=false) {
-        float ratio = resized ? kRatio : 1.0f;
-        int ci = resized ? CMAT_RESIZE : CMAT;
-        row = ci + (int)std::round((p.x-odom_pos.x)*VOXEL_DIM_INV*ratio);
-        col = ci + (int)std::round((p.y-odom_pos.y)*VOXEL_DIM_INV*ratio);
-        int ms = resized ? MAT_RESIZE : MAT_SIZE;
-        row = std::max(0, std::min(row, ms-1));
-        col = std::max(0, std::min(col, ms-1));
-    }
-
-    Point3D CVToPoint3D(const cv::Point2f& cv_p) {
-        Point3D p;
-        p.x = (cv_p.y - CMAT_RESIZE)*voxel_dim/kRatio + odom_pos.x;
-        p.y = (cv_p.x - CMAT_RESIZE)*voxel_dim/kRatio + odom_pos.y;
-        p.z = odom_pos.z;
-        return p;
-    }
-
-    // Build 2D occupancy image from obstacle cloud, extract contours
-    void BuildAndExtract(const Point3D& odom_p,
-                         const std::vector<smartnav::PointXYZI>& obs_points,
-                         std::vector<PointStack>& realworld_contours) {
-        odom_pos = odom_p;
-        img_mat = cv::Mat::zeros(MAT_SIZE, MAT_SIZE, CV_32FC1);
-        // Project points into image
-        for (const auto& pp : obs_points) {
-            Point3D p3(pp.x, pp.y, pp.z);
-            int r, c;
-            PointToImgSub(p3, r, c, false);
-            if (r>=0 && r<MAT_SIZE && c>=0 && c<MAT_SIZE) {
-                for (int dr=-1; dr<=1; dr++) for (int dc=-1; dc<=1; dc++) {
-                    int rr=r+dr, cc=c+dc;
-                    if (rr>=0&&rr<MAT_SIZE&&cc>=0&&cc<MAT_SIZE) img_mat.at<float>(rr,cc)+=1.0f;
-                }
-            }
-        }
-        if (G.is_static_env) {
-            // no threshold for static
-        } else {
-            cv::threshold(img_mat, img_mat, kThredValue, 1.0, cv::ThresholdTypes::THRESH_BINARY);
-        }
-        // Resize and blur
-        cv::Mat rimg;
-        img_mat.convertTo(rimg, CV_8UC1, 255);
-        cv::resize(rimg, rimg, cv::Size(), kRatio, kRatio, cv::INTER_LINEAR);
-        cv::boxFilter(rimg, rimg, -1, cv::Size(kBlurSize, kBlurSize), cv::Point(-1,-1), false);
-        // Find contours
-        std::vector<std::vector<cv::Point2i>> raw_contours;
-        refined_hierarchy.clear();
-        cv::findContours(rimg, raw_contours, refined_hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_TC89_L1);
-        refined_contours.resize(raw_contours.size());
-        for (std::size_t i=0; i<raw_contours.size(); i++) {
-            cv::approxPolyDP(raw_contours[i], refined_contours[i], DIST_LIMIT, true);
-        }
-        // Convert to real-world coordinates
-        realworld_contours.clear();
-        realworld_contours.resize(refined_contours.size());
-        for (std::size_t i=0; i<refined_contours.size(); i++) {
-            for (const auto& cvp : refined_contours[i]) {
-                realworld_contours[i].push_back(CVToPoint3D(cvp));
-            }
-        }
-    }
-};
-#endif
-
-// ---------------------------------------------------------------------------
-//  Contour graph manager — simplified
-//  (Port of contour_graph.cpp)
-// ---------------------------------------------------------------------------
-struct ContourGraphManager {
-    NavNodePtr odom_node = nullptr;
-    float kPillarPerimeter = 3.2f;
-
-    void UpdateContourGraph(const NavNodePtr& odom, const std::vector<PointStack>& contours) {
-        odom_node = odom;
-        g_contour_graph.clear();
-        g_contour_polygons.clear();
-        g_polys_ctnodes.clear();
-        for (const auto& poly_pts : contours) {
-            if (poly_pts.size() < 3) continue;
-            auto poly = std::make_shared<Polygon>();
-            poly->N = poly_pts.size();
-            poly->vertices = poly_pts;
-            poly->is_robot_inside = G.PointInsideAPoly(poly_pts, odom->position);
-            // Check if pillar
-            float perim = 0;
-            for (std::size_t i=1; i<poly_pts.size(); i++)
-                perim += (poly_pts[i]-poly_pts[i-1]).norm_flat();
-            poly->perimeter = perim;
-            poly->is_pillar = (perim <= kPillarPerimeter);
-            g_contour_polygons.push_back(poly);
-
-            if (poly->is_pillar) {
-                auto ct = std::make_shared<CTNode>();
-                ct->position = G.AveragePoints(poly_pts);
-                ct->is_global_match = false;
-                ct->is_contour_necessary = false;
-                ct->is_ground_associate = false;
-                ct->nav_node_id = 0;
-                ct->free_direct = PILLAR;
-                ct->poly_ptr = poly;
-                ct->front = nullptr; ct->back = nullptr;
-                g_contour_graph.push_back(ct);
-            } else {
-                CTNodeStack ctstack;
-                int N = (int)poly_pts.size();
-                for (int idx=0; idx<N; idx++) {
-                    auto ct = std::make_shared<CTNode>();
-                    ct->position = poly_pts[idx];
-                    ct->is_global_match = false;
-                    ct->is_contour_necessary = false;
-                    ct->is_ground_associate = false;
-                    ct->nav_node_id = 0;
-                    ct->free_direct = UNKNOW;
-                    ct->poly_ptr = poly;
-                    ct->front = nullptr; ct->back = nullptr;
-                    ctstack.push_back(ct);
-                }
-                for (int idx=0; idx<N; idx++) {
-                    ctstack[idx]->front = ctstack[G.Mod(idx-1,N)];
-                    ctstack[idx]->back  = ctstack[G.Mod(idx+1,N)];
-                    g_contour_graph.push_back(ctstack[idx]);
-                }
-                if (!ctstack.empty()) g_polys_ctnodes.push_back(ctstack.front());
-            }
-        }
-        // Analyse surface angles and convexity
-        for (auto& ct : g_contour_graph) {
-            if (ct->free_direct == PILLAR || ct->poly_ptr->is_pillar) {
-                ct->surf_dirs = {Point3D(0,0,-1), Point3D(0,0,-1)};
-                ct->free_direct = PILLAR;
-                continue;
-            }
-            // Front direction
-            auto next = ct->front;
-            float ed = (next->position - ct->position).norm_flat();
-            Point3D sp = ct->position, ep = next->position;
-            while (next && next!=ct && ed < G.kNavClearDist) {
-                sp = ep; next = next->front; ep = next->position;
-                ed = (ep - ct->position).norm_flat();
-            }
-            if (ed < G.kNavClearDist) {
-                ct->surf_dirs = {Point3D(0,0,-1), Point3D(0,0,-1)};
-                ct->free_direct = PILLAR; continue;
-            }
-            ct->surf_dirs.first = G.ContourSurfDirsVec(ep, sp, ct->position, G.kNavClearDist);
-            // Back direction
-            next = ct->back;
-            sp = ct->position; ep = next->position;
-            ed = (ep - ct->position).norm_flat();
-            while (next && next!=ct && ed < G.kNavClearDist) {
-                sp = ep; next = next->back; ep = next->position;
-                ed = (ep - ct->position).norm_flat();
-            }
-            if (ed < G.kNavClearDist) {
-                ct->surf_dirs = {Point3D(0,0,-1), Point3D(0,0,-1)};
-                ct->free_direct = PILLAR; continue;
-            }
-            ct->surf_dirs.second = G.ContourSurfDirsVec(ep, sp, ct->position, G.kNavClearDist);
-            // Convexity analysis
-            Point3D topo = G.SurfTopoDirect(ct->surf_dirs);
-            if (topo.norm_flat() < G.kEpsilon) { ct->free_direct = UNKNOW; continue; }
-            Point3D ev_p = ct->position + topo * G.kLeafSize;
-            ct->free_direct = G.IsConvexPoint(ct->poly_ptr, ev_p) ? CONVEX : CONCAVE;
-        }
-    }
-
-    void ExtractGlobalContours() {
-        g_global_contour.clear();
-        g_boundary_contour.clear();
-        g_local_boundary.clear();
-        g_inactive_contour.clear();
-        g_unmatched_contour.clear();
-        for (const auto& e : g_global_contour_set) {
-            g_global_contour.push_back({e.first->position, e.second->position});
-        }
-        for (const auto& e : g_boundary_contour_set) {
-            g_boundary_contour.push_back({e.first->position, e.second->position});
-        }
-    }
-
-    void ResetCurrentContour() {
-        g_contour_graph.clear();
-        g_contour_polygons.clear();
-        g_polys_ctnodes.clear();
-        g_global_contour_set.clear();
-        g_boundary_contour_set.clear();
-        odom_node = nullptr;
-    }
-};
-
-// ---------------------------------------------------------------------------
-//  Message state — latest received LCM messages
-// ---------------------------------------------------------------------------
-static std::mutex g_state_mutex;
-
-static bool g_odom_init = false;
-static bool g_cloud_init = false;
-static bool g_goal_received = false;
-static Point3D g_robot_pos;
-static Point3D g_goal_point;
-
-// Cached obstacle points for contour detection (from registered_scan)
-static std::vector<smartnav::PointXYZI> g_obs_points;
-
-// ---------------------------------------------------------------------------
-//  LCM message handlers
-// ---------------------------------------------------------------------------
-static void on_odometry(const lcm::ReceiveBuffer*, const std::string&,
-                        const nav_msgs::Odometry* msg) {
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    g_robot_pos.x = (float)msg->pose.pose.position.x;
-    g_robot_pos.y = (float)msg->pose.pose.position.y;
-    g_robot_pos.z = (float)msg->pose.pose.position.z;
-    G.robot_pos = g_robot_pos;
-    if (!g_odom_init) {
-        G.systemStartTime = msg->header.stamp.sec + msg->header.stamp.nsec/1e9;
-        G.map_origin = g_robot_pos;
-        g_odom_init = true;
-        printf("[FAR] Odometry initialized at (%.2f, %.2f, %.2f)\n",
-               g_robot_pos.x, g_robot_pos.y, g_robot_pos.z);
-    }
-}
-
-static void on_registered_scan(const lcm::ReceiveBuffer*, const std::string&,
-                               const sensor_msgs::PointCloud2* msg) {
-    auto pts = smartnav::parse_pointcloud2(*msg);
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    g_obs_points = std::move(pts);
-    g_cloud_init = true;
-}
-
-static void on_goal(const lcm::ReceiveBuffer*, const std::string&,
-                    const geometry_msgs::PointStamped* msg) {
-    std::lock_guard<std::mutex> lk(g_state_mutex);
-    g_goal_point.x = (float)msg->point.x;
-    g_goal_point.y = (float)msg->point.y;
-    g_goal_point.z = (float)msg->point.z;
-    g_goal_received = true;
-    printf("[FAR] Goal received: (%.2f, %.2f, %.2f)\n",
-           g_goal_point.x, g_goal_point.y, g_goal_point.z);
+    return waypoint;
 }
 
 // ---------------------------------------------------------------------------
-//  Main
+// Main
 // ---------------------------------------------------------------------------
+
 int main(int argc, char** argv) {
-    // Signal handling for clean shutdown
-    std::signal(SIGTERM, signal_handler);
-    std::signal(SIGINT,  signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
 
     dimos::NativeModule mod(argc, argv);
 
-    // --- Read configurable parameters from CLI args ---
-    G.robot_dim        = mod.arg_float("robot_dim", 0.8f);
-    G.vehicle_height   = mod.arg_float("vehicle_height", 0.75f);
-    G.kLeafSize        = mod.arg_float("voxel_dim", 0.2f);
-    G.kSensorRange     = mod.arg_float("sensor_range", 30.0f);
-    G.kTerrainRange    = mod.arg_float("terrain_range", 15.0f);
-    G.kLocalPlanRange  = mod.arg_float("local_planner_range", 5.0f);
-    G.is_static_env    = mod.arg_bool("is_static_env", true);
-    G.is_debug         = mod.arg_bool("is_debug", false);
-    G.is_multi_layer   = mod.arg_bool("is_multi_layer", false);
-    float main_freq    = mod.arg_float("update_rate", 5.0f);
-    float converge_d   = mod.arg_float("converge_dist", 1.0f);
-    int momentum_thr   = mod.arg_int("momentum_thred", 5);
+    // ── Get topic strings ──────────────────────────────────────────────────
+    g_terrain_map_ext_topic = mod.has("terrain_map_ext") ? mod.topic("terrain_map_ext") : "";
+    g_terrain_map_topic     = mod.has("terrain_map") ? mod.topic("terrain_map") : "";
+    g_registered_scan_topic = mod.has("registered_scan") ? mod.topic("registered_scan") : "";
+    g_odometry_topic        = mod.has("odometry") ? mod.topic("odometry") : "";
+    g_goal_topic            = mod.has("goal") ? mod.topic("goal") : "";
+    g_stop_movement_topic   = mod.has("stop_movement") ? mod.topic("stop_movement") : "";
+    g_way_point_topic       = mod.has("way_point") ? mod.topic("way_point") : "";
+    g_goal_path_topic       = mod.has("goal_path") ? mod.topic("goal_path") : "";
 
-    // Compute derived parameters (same as LoadROSParams)
-    float floor_height = mod.arg_float("floor_height", 2.0f);
-    G.kHeightVoxel     = G.kLeafSize * 2.0f;
-    G.kNearDist        = G.robot_dim;
-    G.kMatchDist       = G.robot_dim * 2.0f + G.kLeafSize;
-    G.kNavClearDist    = G.robot_dim / 2.0f + G.kLeafSize;
-    G.kProjectDist     = G.kLeafSize;
-    G.kTolerZ          = floor_height - G.kHeightVoxel;
-    float cell_height  = floor_height / 2.5f;
-    G.kCellHeight      = cell_height;
-    G.kMarginDist      = G.kSensorRange - G.kMatchDist;
-    G.kMarginHeight    = G.kTolerZ - G.kCellHeight / 2.0f;
-    float angle_noise_deg = mod.arg_float("angle_noise", 15.0f);
-    float accept_align_deg = mod.arg_float("accept_align", 15.0f);
-    G.kAngleNoise      = angle_noise_deg / 180.0f * (float)M_PI;
-    G.kAcceptAlign     = accept_align_deg / 180.0f * (float)M_PI;
+    // Debug visualization topics
+    std::string g_graph_nodes_topic = mod.has("graph_nodes") ? mod.topic("graph_nodes") : "";
+    std::string g_graph_edges_topic = mod.has("graph_edges") ? mod.topic("graph_edges") : "";
+    std::string g_contour_polygons_topic = mod.has("contour_polygons") ? mod.topic("contour_polygons") : "";
+    std::string g_nav_boundary_topic = mod.has("nav_boundary") ? mod.topic("nav_boundary") : "";
 
-    // Verbose logging only when DEBUG=1
-    const char* debug_env = std::getenv("DEBUG");
-    bool verbose = (debug_env && std::string(debug_env) == "1");
+    // ── Get config params (mirrors LoadROSParams in original FARMaster) ────
+    float update_rate         = mod.arg_float("update_rate", 5.0f);
+    float robot_dim           = mod.arg_float("robot_dim", 0.5f);
+    float voxel_dim           = mod.arg_float("voxel_dim", 0.1f);
+    float sensor_range        = mod.arg_float("sensor_range", 15.0f);
+    float terrain_range       = mod.arg_float("terrain_range", 7.5f);
+    float local_planner_range = mod.arg_float("local_planner_range", 2.5f);
+    float vehicle_height      = mod.arg_float("vehicle_height", 0.75f);
+    float visibility_range    = mod.arg_float("visibility_range", 15.0f);
+    bool  is_static_env       = mod.arg_bool("is_static_env", false);
+    bool  is_viewpoint_extend = mod.arg_bool("is_viewpoint_extend", true);
+    float converge_dist       = mod.arg_float("converge_dist", 0.8f);
+    g_world_frame             = mod.arg("world_frame", "map");
+    g_wp_churn_dist           = mod.arg_float("wp_churn_dist", 0.0f);
 
-    printf("[FAR] Configuration:\n");
-    printf("  robot_dim=%.2f  sensor_range=%.1f  voxel=%.2f  freq=%.1f  verbose=%d\n",
-           G.robot_dim, G.kSensorRange, G.kLeafSize, main_freq, verbose);
-    printf("  static_env=%d  multi_layer=%d  converge_dist=%.2f\n",
-           G.is_static_env, G.is_multi_layer, converge_d);
+    // Remaining params are read inline via mod.arg_*() where they're used.
 
-    // --- LCM setup ---
+    printf("[far_planner] Starting FAR Planner native module\n");
+    printf("[far_planner] terrain_map_ext: %s\n",
+           g_terrain_map_ext_topic.empty() ? "(disabled)" : g_terrain_map_ext_topic.c_str());
+    printf("[far_planner] terrain_map: %s\n",
+           g_terrain_map_topic.empty() ? "(disabled)" : g_terrain_map_topic.c_str());
+    printf("[far_planner] registered_scan: %s\n",
+           g_registered_scan_topic.empty() ? "(disabled)" : g_registered_scan_topic.c_str());
+    printf("[far_planner] odometry: %s\n",
+           g_odometry_topic.empty() ? "(disabled)" : g_odometry_topic.c_str());
+    printf("[far_planner] goal: %s\n",
+           g_goal_topic.empty() ? "(disabled)" : g_goal_topic.c_str());
+    printf("[far_planner] way_point: %s\n",
+           g_way_point_topic.empty() ? "(disabled)" : g_way_point_topic.c_str());
+    printf("[far_planner] goal_path: %s\n",
+           g_goal_path_topic.empty() ? "(disabled)" : g_goal_path_topic.c_str());
+    printf("[far_planner] update_rate=%.1f Hz  sensor_range=%.1f  vehicle_height=%.2f\n",
+           update_rate, sensor_range, vehicle_height);
+
+    // ── Init LCM ───────────────────────────────────────────────────────────
     lcm::LCM lcm;
     if (!lcm.good()) {
-        fprintf(stderr, "[FAR] ERROR: LCM init failed\n");
+        fprintf(stderr, "[far_planner] Error: LCM init failed\n");
         return 1;
     }
+    g_lcm = &lcm;
 
-    std::string topic_scan  = mod.topic("registered_scan");
-    std::string topic_odom  = mod.topic("odometry");
-    std::string topic_goal  = mod.topic("goal");
-    std::string topic_wp    = mod.topic("way_point");
+    // ── Subscribe to input topics ──────────────────────────────────────────
+    Handlers handlers;
+    if (!g_odometry_topic.empty())
+        lcm.subscribe(g_odometry_topic, &Handlers::on_odometry, &handlers);
+    if (!g_terrain_map_ext_topic.empty())
+        lcm.subscribe(g_terrain_map_ext_topic, &Handlers::on_terrain_ext, &handlers);
+    if (!g_terrain_map_topic.empty())
+        lcm.subscribe(g_terrain_map_topic, &Handlers::on_terrain, &handlers);
+    if (!g_registered_scan_topic.empty())
+        lcm.subscribe(g_registered_scan_topic, &Handlers::on_registered_scan, &handlers);
+    if (!g_goal_topic.empty())
+        lcm.subscribe(g_goal_topic, &Handlers::on_goal, &handlers);
+    if (!g_stop_movement_topic.empty())
+        lcm.subscribe(g_stop_movement_topic, &Handlers::on_stop_movement, &handlers);
 
-    // LCM subscribe requires member-function + object pointer; wrap free fns
-    // in a trivial handler struct.
-    struct LcmHandler {
-        static void odom_cb(const lcm::ReceiveBuffer* b, const std::string& c,
-                            const nav_msgs::Odometry* m) { on_odometry(b, c, m); }
-        static void scan_cb(const lcm::ReceiveBuffer* b, const std::string& c,
-                            const sensor_msgs::PointCloud2* m) { on_registered_scan(b, c, m); }
-        static void goal_cb(const lcm::ReceiveBuffer* b, const std::string& c,
-                            const geometry_msgs::PointStamped* m) { on_goal(b, c, m); }
-        void odom(const lcm::ReceiveBuffer* b, const std::string& c,
-                  const nav_msgs::Odometry* m) { on_odometry(b, c, m); }
-        void scan(const lcm::ReceiveBuffer* b, const std::string& c,
-                  const sensor_msgs::PointCloud2* m) { on_registered_scan(b, c, m); }
-        void goal(const lcm::ReceiveBuffer* b, const std::string& c,
-                  const geometry_msgs::PointStamped* m) { on_goal(b, c, m); }
-    } lcm_handler;
-    lcm.subscribe(topic_odom, &LcmHandler::odom, &lcm_handler);
-    lcm.subscribe(topic_scan, &LcmHandler::scan, &lcm_handler);
-    lcm.subscribe(topic_goal, &LcmHandler::goal, &lcm_handler);
+    // ── Set FARUtil static parameters ──────────────────────────────────────
+    // These correspond to LoadROSParams() in the original FARMaster.
+    // Mirror LoadROSParams() from original FARMaster — set FARUtil statics.
+    // Note: kEpsilon and kINF are const statics, already initialized.
+    FARUtil::vehicle_height  = vehicle_height;
+    FARUtil::kSensorRange    = sensor_range;
+    FARUtil::kTerrainRange   = std::min(terrain_range, sensor_range);
+    FARUtil::kLocalPlanRange = local_planner_range;
+    FARUtil::kLeafSize       = voxel_dim;
+    FARUtil::kNearDist       = robot_dim;
+    FARUtil::kHeightVoxel    = voxel_dim * 2.0f;
+    FARUtil::kMatchDist      = robot_dim * 2.0f + voxel_dim;
+    FARUtil::kNavClearDist   = robot_dim / 2.0f + voxel_dim;
+    FARUtil::kProjectDist    = voxel_dim;
+    FARUtil::kMarginDist     = sensor_range - FARUtil::kMatchDist;
+    FARUtil::kFreeZ          = 0.1f;
+    float floor_height_val   = mod.arg_float("floor_height", 2.0f);
+    FARUtil::kTolerZ         = floor_height_val - FARUtil::kHeightVoxel;
+    FARUtil::kCellLength     = mod.arg_float("cell_length", 5.0f);
+    FARUtil::kCellHeight     = floor_height_val / 2.5f;
+    FARUtil::kMarginHeight   = FARUtil::kTolerZ - FARUtil::kCellHeight / 2.0f;
+    FARUtil::kVizRatio       = mod.arg_float("visualize_ratio", 0.4f);
+    FARUtil::worldFrameId    = g_world_frame;
+    FARUtil::kObsInflate     = mod.arg_int("obs_inflate_size", 2);
+    FARUtil::kAngleNoise     = mod.arg_float("angle_noise", 15.0f) / 180.0f * M_PI;
+    FARUtil::kAcceptAlign    = mod.arg_float("accept_max_align_angle", 15.0f) / 180.0f * M_PI;
+    FARUtil::kNewPIThred     = mod.arg_float("new_intensity_thred", 2.0f);
+    FARUtil::kObsDecayTime   = mod.arg_float("dynamic_obs_decay_time", 10.0f);
+    FARUtil::kNewDecayTime   = mod.arg_float("new_points_decay_time", 2.0f);
+    FARUtil::kDyObsThred     = mod.arg_int("dyobs_update_thred", 4);
+    FARUtil::KNewPointC      = mod.arg_int("new_point_counter", 10);
+    FARUtil::IsStaticEnv     = is_static_env;
+    FARUtil::IsDebug         = mod.arg_bool("is_debug_output", false);
+    FARUtil::IsMultiLayer    = mod.arg_bool("is_multi_layer", false);
+    FARUtil::robot_dim       = robot_dim;
+    FARUtil::systemStartTime = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
-    printf("[FAR] Subscribed: scan=%s  odom=%s  goal=%s\n",
-           topic_scan.c_str(), topic_odom.c_str(), topic_goal.c_str());
-    printf("[FAR] Publishing: way_point=%s\n", topic_wp.c_str());
+    // Init FARUtil kdtrees
+    FARUtil::kdtree_new_cloud_ = PointKdTreePtr(new pcl::KdTreeFLANN<PCLPoint>());
+    PointCloudPtr init_cloud(new pcl::PointCloud<PCLPoint>());
+    PCLPoint zero_p;
+    zero_p.x = zero_p.y = zero_p.z = 0.0f;
+    zero_p.intensity = 0.0f;
+    init_cloud->push_back(zero_p);
+    FARUtil::kdtree_new_cloud_->setInputCloud(init_cloud);
+    FARUtil::robot_pos = Point3D(0, 0, 0);
+    FARUtil::free_odom_p = Point3D(0, 0, 0);
+    FARUtil::odom_pos = Point3D(0, 0, 0);
 
-    // --- Module objects ---
-    DynamicGraphManager graph_mgr;
-    GraphPlanner planner;
-    ContourGraphManager contour_mgr;
-    planner.converge_dist = converge_d;
-    planner.momentum_thred = momentum_thr;
-    graph_mgr.finalize_thred = mod.arg_int("finalize_thred", 3);
-    graph_mgr.votes_size = mod.arg_int("votes_size", 10);
-    graph_mgr.dumper_thred = mod.arg_int("dumper_thred", 3);
-    contour_mgr.kPillarPerimeter = G.robot_dim * 4.0f;
+    // ── Create stub CompatNode for algorithm modules that need rclcpp::Node ─
+    auto nh = std::make_shared<CompatNode>("far_planner");
 
-#ifdef HAS_OPENCV
-    ContourDetector contour_det;
-    contour_det.sensor_range = G.kSensorRange;
-    contour_det.voxel_dim = G.kLeafSize;
-    contour_det.kRatio = mod.arg_float("resize_ratio", 5.0f);
-    contour_det.kThredValue = mod.arg_int("filter_count_value", 5);
-    contour_det.kBlurSize = (int)std::round(G.kNavClearDist / G.kLeafSize);
-    contour_det.Init();
-#endif
+    // ── Initialize algorithm modules ───────────────────────────────────────
 
-    bool is_graph_init = false;
-    const int loop_ms = (int)(1000.0f / main_freq);
+    // ContourDetector
+    ContourDetector contour_detector;
+    {
+        ContourDetectParams cd_params;
+        cd_params.sensor_range = sensor_range;
+        cd_params.voxel_dim    = voxel_dim;
+        cd_params.kRatio       = mod.arg_float("resize_ratio", 5.0f);
+        cd_params.kThredValue  = mod.arg_int("filter_count_value", 5);
+        cd_params.kBlurSize    = static_cast<int>(std::round(FARUtil::kNavClearDist / voxel_dim));
+        cd_params.is_save_img  = false;
+        cd_params.img_path     = "";
+        contour_detector.Init(cd_params);
+    }
 
-    printf("[FAR] Entering main loop (period=%dms)...\n", loop_ms);
+    // ContourGraph
+    ContourGraph contour_graph;
+    {
+        ContourGraphParams cg_params;
+        cg_params.kPillarPerimeter = robot_dim * 4.0f;
+        contour_graph.Init(nh, cg_params);
+    }
 
-    // --- Main loop ---
-    while (!g_shutdown.load()) {
-        // Handle pending LCM messages (non-blocking with timeout)
-        lcm.handleTimeout(loop_ms);
+    // DynamicGraph
+    DynamicGraph dynamic_graph;
+    {
+        DynamicGraphParams dg_params;
+        dg_params.dumper_thred             = mod.arg_int("clear_dumper_thred", 3);
+        dg_params.finalize_thred           = mod.arg_int("node_finalize_thred", 3);
+        dg_params.pool_size                = mod.arg_int("filter_pool_size", 12);
+        dg_params.votes_size               = mod.arg_int("connect_votes_size", 10);
+        dg_params.kConnectAngleThred       = FARUtil::kAcceptAlign;
+        dg_params.filter_pos_margin        = FARUtil::kNavClearDist;
+        dg_params.filter_dirs_margin       = FARUtil::kAngleNoise;
+        dg_params.frontier_perimeter_thred = FARUtil::kMatchDist * 4.0f;
+        dynamic_graph.Init(nh, dg_params);
+    }
 
-        // Check preconditions
-        bool odom_ok, cloud_ok, goal_pending;
-        Point3D robot_p, goal_p;
-        std::vector<smartnav::PointXYZI> obs_snap;
+    // GraphPlanner
+    GraphPlanner graph_planner;
+    {
+        GraphPlannerParams gp_params;
+        gp_params.converge_dist  = converge_dist;
+        gp_params.adjust_radius  = mod.arg_float("goal_adjust_radius", 10.0f);
+        gp_params.momentum_dist  = robot_dim / 2.0f;
+        gp_params.is_autoswitch  = mod.arg_bool("is_attempt_autoswitch", true);
+        gp_params.free_thred     = mod.arg_int("free_counter_thred", 5);
+        gp_params.votes_size     = mod.arg_int("reach_goal_vote_size", 5);
+        gp_params.momentum_thred = mod.arg_int("path_momentum_thred", 5);
+        gp_params.path_switch_cost_ratio = mod.arg_float("path_switch_cost_ratio", 0.85f);
+        gp_params.min_path_hold_frames = mod.arg_int("min_path_hold_frames", 10);
+        graph_planner.Init(nh, gp_params);
+    }
+
+    // MapHandler
+    MapHandler map_handler;
+    {
+        MapHandlerParams mh_params;
+        mh_params.sensor_range     = sensor_range;
+        mh_params.floor_height     = floor_height_val;
+        mh_params.cell_length      = FARUtil::kCellLength;
+        mh_params.cell_height      = FARUtil::kCellHeight;
+        mh_params.grid_max_length  = mod.arg_float("map_grid_max_length", 1000.0f);
+        mh_params.grid_max_height  = mod.arg_float("map_grad_max_height", 100.0f);
+        mh_params.height_voxel_dim = FARUtil::kHeightVoxel;
+        map_handler.Init(mh_params);
+    }
+
+    // ScanHandler
+    ScanHandler scan_handler;
+    {
+        ScanHandlerParams sh_params;
+        sh_params.terrain_range = terrain_range;
+        sh_params.voxel_size    = voxel_dim;
+        sh_params.ceil_height   = floor_height_val;
+        scan_handler.Init(sh_params);
+    }
+
+    // ── Tracking state for main loop ───────────────────────────────────────
+    bool is_map_init = false;
+    bool has_received_odom = false;
+    Point3D robot_pos(0, 0, 0);
+    Point3D last_robot_pos(0, 0, 0);
+    int frame_count = 0;
+    // Persist the last goal so we can re-set it after planning failures.
+    // In the original ROS code, the goal subscriber continuously re-delivers
+    // the goal. In our single-shot LCM design, we must handle retries ourselves.
+    bool has_pending_goal = false;
+    Point3D pending_goal_pos(0, 0, 0);
+    double last_goal_retry_time = 0.0;
+    const double goal_retry_interval = 2.0;  // seconds between retry attempts
+    // Waypoint smoothing: track last published waypoint to reduce churn
+    Point3D last_published_waypoint(0, 0, 0);
+    bool has_published_waypoint = false;
+    NavNodePtr last_nav_node = nullptr;
+    // Heading momentum for smooth waypoint projection (matches original nav_heading_)
+    Point3D nav_heading(0, 0, 0);
+
+    // ── Main loop ──────────────────────────────────────────────────────────
+    float loop_period_ms = 1000.0f / update_rate;
+    printf("[far_planner] Starting main loop at %.1f Hz\n", update_rate);
+    fflush(stdout);
+
+    while (g_running.load()) {
+        auto loop_start = std::chrono::high_resolution_clock::now();
+
+        // Handle all pending LCM messages (non-blocking)
+        while (lcm.handleTimeout(0) > 0) {}
+
+        double now_sec = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // ── Snapshot input buffers ─────────────────────────────────────────
+        nav_msgs::Odometry cur_odom;
+        bool have_odom = false;
         {
-            std::lock_guard<std::mutex> lk(g_state_mutex);
-            odom_ok = g_odom_init;
-            cloud_ok = g_cloud_init;
-            goal_pending = g_goal_received;
-            robot_p = g_robot_pos;
-            goal_p = g_goal_point;
-            if (cloud_ok) {
-                obs_snap = g_obs_points; // copy
-            }
-            if (goal_pending) g_goal_received = false;
-        }
-
-        // Debug: periodic status (every ~2s at 5Hz)
-        if (verbose) {
-            static int dbg_ctr = 0;
-            if (++dbg_ctr % 10 == 0) {
-                auto gp_tmp = planner.goal_node;
-                float goal_dist = gp_tmp ? (robot_p - Point3D(gp_tmp->position.x, gp_tmp->position.y, gp_tmp->position.z)).norm() : 0.0f;
-                printf("[FAR] status: odom=%d cloud=%d graph_init=%d "
-                       "graph_nodes=%zu  robot=(%.2f,%.2f)  "
-                       "has_goal=%d  goal=(%.2f,%.2f)  goal_dist=%.1fm  "
-                       "obs_pts=%zu\n",
-                       odom_ok, cloud_ok, is_graph_init,
-                       g_global_graph_nodes.size(),
-                       robot_p.x, robot_p.y,
-                       (gp_tmp != nullptr), goal_p.x, goal_p.y, goal_dist,
-                       obs_snap.size());
-                fflush(stdout);
+            std::lock_guard<std::mutex> lock(g_odom_mutex);
+            if (g_has_odom) {
+                cur_odom = g_latest_odom;
+                have_odom = true;
             }
         }
 
-        if (!odom_ok || !cloud_ok) continue;
-
-        // --- Main graph update cycle (port of MainLoopCallBack) ---
-        G.Timer.start_time("V-Graph Update");
-
-        // 1. Update robot position in graph
-        graph_mgr.UpdateRobotPosition(robot_p);
-        auto odom_node = graph_mgr.GetOdomNode();
-        if (!odom_node) continue;
-
-        // free_odom_p: for now, same as odom
-        G.free_odom_p = odom_node->position;
-
-        // 2. Extract contours from obstacle cloud
-        std::vector<PointStack> realworld_contours;
-#ifdef HAS_OPENCV
-        contour_det.BuildAndExtract(odom_node->position, obs_snap, realworld_contours);
-#endif
-
-        // 3. Update contour graph
-        contour_mgr.UpdateContourGraph(odom_node, realworld_contours);
-
-        // 4. Update global near nodes
-        graph_mgr.UpdateGlobalNearNodes();
-
-        // 5. Extract new graph nodes (trajectory nodes)
-        NodePtrStack new_nodes;
-        if (graph_mgr.ExtractGraphNodes()) {
-            new_nodes = graph_mgr.new_nodes;
+        sensor_msgs::PointCloud2 cur_terrain_ext;
+        bool have_terrain_ext = false;
+        {
+            std::lock_guard<std::mutex> lock(g_terrain_ext_mutex);
+            if (g_has_terrain_ext) {
+                cur_terrain_ext = g_latest_terrain_ext;
+                have_terrain_ext = true;
+                g_has_terrain_ext = false;  // consume
+            }
         }
 
-        // 6. Update navigation graph edges
-        graph_mgr.UpdateNavGraph(new_nodes, false);
-
-        // 7. Extract global contours for polygon collision checking
-        contour_mgr.ExtractGlobalContours();
-
-        auto nav_graph = graph_mgr.GetNavGraph();
-        planner.current_graph = nav_graph;
-
-        double vg_time = G.Timer.end_time("V-Graph Update", false);
-
-        if (!is_graph_init && !nav_graph.empty()) {
-            is_graph_init = true;
-            printf("[FAR] V-Graph initialized with %zu nodes\n", nav_graph.size());
+        sensor_msgs::PointCloud2 cur_terrain;
+        bool have_terrain = false;
+        {
+            std::lock_guard<std::mutex> lock(g_terrain_mutex);
+            if (g_has_terrain) {
+                cur_terrain = g_latest_terrain;
+                have_terrain = true;
+                g_has_terrain = false;
+            }
         }
 
-        // --- Goal handling ---
-        if (goal_pending) {
-            planner.UpdateGoal(goal_p);
+        sensor_msgs::PointCloud2 cur_scan;
+        bool have_scan = false;
+        {
+            std::lock_guard<std::mutex> lock(g_scan_mutex);
+            if (g_has_scan) {
+                cur_scan = g_latest_scan;
+                have_scan = true;
+                g_has_scan = false;
+            }
         }
 
-        // --- Planning cycle (port of PlanningCallBack) ---
-        if (!is_graph_init) continue;
+        geometry_msgs::PointStamped cur_goal_msg;
+        bool have_new_goal = false;
+        bool is_cancelled = false;
+        {
+            std::lock_guard<std::mutex> lock(g_goal_mutex);
+            if (g_goal_cancelled) {
+                is_cancelled = true;
+                g_goal_cancelled = false;
+            }
+            if (g_has_goal && !g_goal_consumed) {
+                cur_goal_msg = g_latest_goal;
+                have_new_goal = true;
+                g_goal_consumed = true;
+            }
+        }
 
-        auto gp = planner.goal_node;
-        if (!gp) {
-            planner.UpdateGraphTraverability(odom_node, nullptr);
-        } else {
-            // Update goal connectivity
-            planner.UpdateGoalConnects(gp);
-            planner.current_graph = graph_mgr.GetNavGraph();
+        // Need odometry to do anything
+        if (!have_odom) {
+            auto elapsed = std::chrono::high_resolution_clock::now() - loop_start;
+            auto elapsed_ms = std::chrono::duration<float, std::milli>(elapsed).count();
+            if (elapsed_ms < loop_period_ms) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(
+                    static_cast<int>(loop_period_ms - elapsed_ms)));
+            }
+            continue;
+        }
 
-            // Dijkstra traversability
-            planner.UpdateGraphTraverability(odom_node, gp);
+        // ── Update robot position ──────────────────────────────────────────
+        robot_pos = odom_to_point3d(cur_odom);
+        FARUtil::robot_pos = robot_pos;
+        FARUtil::odom_pos = robot_pos;
 
-            // Path to goal
+        if (!has_received_odom) {
+            has_received_odom = true;
+            last_robot_pos = robot_pos;
+            printf("[far_planner] First odometry received: (%.2f, %.2f, %.2f)\n",
+                   robot_pos.x, robot_pos.y, robot_pos.z);
+            fflush(stdout);
+        }
+
+        // Init map origin on first odometry
+        if (!is_map_init) {
+            map_handler.SetMapOrigin(robot_pos);
+            scan_handler.ReInitGrids();
+            is_map_init = true;
+            printf("[far_planner] Map origin set\n");
+            fflush(stdout);
+        }
+
+        // Update positions in algorithm modules
+        map_handler.UpdateRobotPosition(robot_pos);
+        scan_handler.UpdateRobotPosition(robot_pos);
+        dynamic_graph.UpdateRobotPosition(robot_pos);
+
+        // ── Process terrain_map_ext (obstacle + free separation) ───────────
+        PointCloudPtr obs_cloud(new pcl::PointCloud<PCLPoint>());
+        PointCloudPtr free_cloud(new pcl::PointCloud<PCLPoint>());
+        PointCloudPtr terrain_height_cloud(new pcl::PointCloud<PCLPoint>());
+        bool have_new_clouds = false;
+
+        if (have_terrain_ext) {
+            PointCloudPtr terrain_ext_pcl = lcm_pc2_to_pcl(cur_terrain_ext);
+            if (!terrain_ext_pcl->empty()) {
+                // Upstream uses CropBoxCloud with terrain_range, not sensor_range
+                FARUtil::CropPCLCloud(terrain_ext_pcl, robot_pos, FARUtil::kTerrainRange);
+                FARUtil::RemoveNanInfPoints(terrain_ext_pcl);
+                FARUtil::ExtractFreeAndObsCloud(terrain_ext_pcl, free_cloud, obs_cloud);
+                have_new_clouds = true;
+                if (!FARUtil::IsStaticEnv) {
+                    FARUtil::RemoveOverlapCloud(obs_cloud, FARUtil::stack_dyobs_cloud_, true);
+                }
+                map_handler.UpdateObsCloudGrid(obs_cloud);
+                map_handler.UpdateFreeCloudGrid(free_cloud);
+                // NOTE: UpdateTerrainHeightGrid is done later using surround_free_cloud
+                // (matching upstream TerrainCallBack lines 746-747)
+            }
+        }
+
+        // ── Process terrain_map (local terrain for TerrainPlanner) ─────────
+        // Upstream: TerrainLocalCallBack populates local_terrain_obs_ from
+        // /terrain_local_cloud. In DimOS, terrain_map serves this role.
+        // When terrain_map_ext is absent, terrain_map also feeds the grids.
+        if (have_terrain) {
+            PointCloudPtr terrain_pcl = lcm_pc2_to_pcl(cur_terrain);
+            if (!terrain_pcl->empty()) {
+                FARUtil::CropPCLCloud(terrain_pcl, robot_pos, FARUtil::kTerrainRange);
+                FARUtil::RemoveNanInfPoints(terrain_pcl);
+
+                // Populate local_terrain_obs_ (upstream TerrainLocalCallBack)
+                if (!FARUtil::IsStaticEnv) {
+                    FARUtil::ExtractFreeAndObsCloud(
+                        terrain_pcl, FARUtil::local_terrain_free_, FARUtil::local_terrain_obs_);
+                }
+
+                // When terrain_map_ext is absent, also use terrain_map for grids
+                if (!have_terrain_ext) {
+                    FARUtil::ExtractFreeAndObsCloud(terrain_pcl, free_cloud, obs_cloud);
+                    have_new_clouds = true;
+                    if (!FARUtil::IsStaticEnv) {
+                        FARUtil::RemoveOverlapCloud(obs_cloud, FARUtil::stack_dyobs_cloud_, true);
+                    }
+                    map_handler.UpdateObsCloudGrid(obs_cloud);
+                    map_handler.UpdateFreeCloudGrid(free_cloud);
+                }
+            }
+        }
+
+        // ── Process registered_scan (for dynamic obstacle detection) ───────
+        if (have_scan) {
+            PointCloudPtr scan_pcl = lcm_pc2_to_pcl(cur_scan);
+            if (!scan_pcl->empty()) {
+                FARUtil::CropPCLCloud(scan_pcl, robot_pos, sensor_range);
+                FARUtil::RemoveNanInfPoints(scan_pcl);
+                PointCloudPtr scan_free_cloud(new pcl::PointCloud<PCLPoint>());
+                scan_handler.SetCurrentScanCloud(scan_pcl, scan_free_cloud);
+            }
+        }
+
+        // ── Handle goal cancellation (NaN sentinel from teleop) ───────────
+        if (is_cancelled) {
+            has_pending_goal = false;
+            has_published_waypoint = false;
+            last_nav_node = nullptr;
+            graph_planner.GoalReset();
+            // Publish robot position as stop waypoint
+            if (!g_way_point_topic.empty()) {
+                auto wp_msg = point3d_to_lcm_point_stamped(robot_pos, now_sec);
+                g_lcm->publish(g_way_point_topic, &wp_msg);
+            }
+            printf("[far_planner] Goal cancelled — idle until new goal\n");
+            fflush(stdout);
+        }
+
+        // ── Handle new goal ────────────────────────────────────────────────
+        if (have_new_goal) {
+            Point3D goal_pos(
+                static_cast<float>(cur_goal_msg.point.x),
+                static_cast<float>(cur_goal_msg.point.y),
+                static_cast<float>(cur_goal_msg.point.z));
+            graph_planner.UpdateGoal(goal_pos);
+            pending_goal_pos = goal_pos;
+            has_pending_goal = true;
+            last_goal_retry_time = 0.0;  // allow immediate first retry if needed
+            printf("[far_planner] New goal received: (%.2f, %.2f, %.2f)\n",
+                   goal_pos.x, goal_pos.y, goal_pos.z);
+            fflush(stdout);
+        }
+        // Re-set the goal if it was cleared by a planning failure (rate-limited)
+        if (has_pending_goal && graph_planner.GetGoalNodePtr() == nullptr) {
+            if (now_sec - last_goal_retry_time >= goal_retry_interval) {
+                graph_planner.UpdateGoal(pending_goal_pos);
+                last_goal_retry_time = now_sec;
+                printf("[far_planner] frame=%d goal re-set after failure (retry)\n", frame_count); fflush(stdout);
+            }
+        }
+
+        // ── Main graph update loop (mirrors FARMaster::MainLoopCallBack) ───
+        // Order matches original FARMaster exactly (lines 169-236).
+        if (have_new_clouds && is_map_init) {
+            // Extract new observation points (before GetSurroundObsCloud updates the grid)
+            // Original: ExtractNewObsPointCloud(temp_obs_ptr_, surround_obs_cloud_, cur_new_cloud_)
+            //   cloudIn = current frame obs (intensity 0), cloudRefer = surround (intensity 255)
+            //   Result: points in current frame NOT in surround = genuinely new observations
+            PointCloudPtr new_obs_cloud(new pcl::PointCloud<PCLPoint>());
+            if (!FARUtil::surround_obs_cloud_->empty()) {
+                FARUtil::ExtractNewObsPointCloud(obs_cloud, FARUtil::surround_obs_cloud_, new_obs_cloud);
+            }
+
+            // Update surround clouds from grid (original lines 746-749)
+            PointCloudPtr surround_obs(new pcl::PointCloud<PCLPoint>());
+            PointCloudPtr surround_free(new pcl::PointCloud<PCLPoint>());
+            map_handler.GetSurroundFreeCloud(surround_free);
+            // Terrain height uses surround free cloud, not frame free cloud
+            // (upstream TerrainCallBack lines 746-747)
+            map_handler.UpdateTerrainHeightGrid(surround_free, terrain_height_cloud);
+            map_handler.GetSurroundObsCloud(surround_obs);
+            FARUtil::surround_obs_cloud_ = surround_obs;
+
+            // Dynamic obstacle handling (original lines 751-769)
+            // Original calls FARMaster::ExtractDynamicObsFromScan which does:
+            //   scan_handler.ReInitGrids()
+            //   scan_handler.SetCurrentScanCloud(scanCloud, freeCloud)
+            //   scan_handler.ExtractDyObsCloud(obsCloud, dyObsOut)
+            // SetCurrentScanCloud was already called in the scan processing section above.
+            FARUtil::cur_dyobs_cloud_->clear();
+            if (!FARUtil::IsStaticEnv) {
+                scan_handler.SetSurroundObsCloud(surround_obs, true);
+                PointCloudPtr dyobs_cloud(new pcl::PointCloud<PCLPoint>());
+                scan_handler.ExtractDyObsCloud(surround_obs, dyobs_cloud);
+                if (static_cast<int>(dyobs_cloud->size()) > FARUtil::kDyObsThred) {
+                    FARUtil::InflateCloud(dyobs_cloud, voxel_dim, 1, true);
+                    map_handler.RemoveObsCloudFromGrid(dyobs_cloud);
+                    FARUtil::RemoveOverlapCloud(surround_obs, dyobs_cloud);
+                    FARUtil::FilterCloud(dyobs_cloud, voxel_dim);
+                    *new_obs_cloud += *dyobs_cloud;
+                    FARUtil::FilterCloud(new_obs_cloud, voxel_dim);
+                }
+                // Accumulate dynamic obstacles with time decay (original line 768)
+                FARUtil::StackCloudByTime(dyobs_cloud, FARUtil::stack_dyobs_cloud_, FARUtil::kObsDecayTime, nh);
+                FARUtil::cur_dyobs_cloud_ = dyobs_cloud;
+            } else {
+                scan_handler.SetSurroundObsCloud(surround_obs, false);
+            }
+
+            // Accumulate new observations with time decay, then update KD-trees
+            // (original lines 772-773: StackCloudByTime + UpdateKdTrees(stack_new_cloud_))
+            FARUtil::StackCloudByTime(new_obs_cloud, FARUtil::stack_new_cloud_, FARUtil::kNewDecayTime, nh);
+            FARUtil::UpdateKdTrees(FARUtil::stack_new_cloud_);
+
+            const NodePtrStack& nav_graph = dynamic_graph.GetNavGraph();
+
+            const NavNodePtr graph_odom_node = dynamic_graph.GetOdomNode();
+            if (graph_odom_node != nullptr) {
+                // Contour extraction (original lines 193-194)
+                std::vector<PointStack> realworld_contour;
+                contour_detector.BuildTerrainImgAndExtractContour(
+                    graph_odom_node, surround_obs, realworld_contour);
+                contour_graph.UpdateContourGraph(graph_odom_node, realworld_contour);
+
+                // Adjust heights BEFORE matching (original lines 200-201)
+                map_handler.AdjustCTNodeHeight(ContourGraph::contour_graph_);
+                map_handler.AdjustNodesHeight(nav_graph);
+
+                // Update near nodes BEFORE matching (original lines 203-204)
+                dynamic_graph.UpdateGlobalNearNodes();
+                const NodePtrStack& near_nodes = dynamic_graph.GetExtendLocalNode();
+
+                // Match contour with nav graph (original line 206)
+                CTNodeStack new_convex_vertices;
+                contour_graph.MatchContourWithNavGraph(nav_graph, near_nodes, new_convex_vertices);
+
+                // Extract and update graph (original lines 214-222)
+                dynamic_graph.ExtractGraphNodes(new_convex_vertices);
+
+                const bool is_freeze_vgraph = false;
+                NodePtrStack clear_nodes;
+                dynamic_graph.UpdateNavGraph(
+                    dynamic_graph.GetNewNodes(), is_freeze_vgraph, clear_nodes);
+
+                if (!clear_nodes.empty()) {
+                    PointCloudPtr clear_cloud(new pcl::PointCloud<PCLPoint>());
+                    for (const auto& node : clear_nodes) {
+                        clear_cloud->push_back(FARUtil::Point3DToPCLPoint(node->position));
+                    }
+                    map_handler.RemoveObsCloudFromGrid(clear_cloud);
+                }
+
+                contour_graph.ExtractGlobalContours();
+
+                // Periodic status
+                if (frame_count % 50 == 0) {
+                    const auto& polys = ContourGraph::GetContourPolygons();
+                    int total_edges = 0;
+                    for (const auto& n : dynamic_graph.GetNavGraph()) total_edges += n->connect_nodes.size();
+                    printf("[far_planner] frame=%d nodes=%zu edges=%d polys=%zu global_contours=%zu boundary=%zu robot=(%.1f,%.1f)\n",
+                           frame_count, dynamic_graph.GetNavGraph().size(), total_edges / 2,
+                           polys.size(), ContourGraph::global_contour_.size(),
+                           ContourGraph::boundary_contour_.size(),
+                           robot_pos.x, robot_pos.y);
+                    fflush(stdout);
+                }
+                // NOTE: UpdaetVGraph is called in the planning block below,
+                // AFTER UpdateGoalNavNodeConnects, matching the original order.
+
+                // Publish navigation boundary (local obstacle edges near robot)
+                // Matches original FARMaster::LocalBoundaryHandler
+                if (!g_nav_boundary_topic.empty()) {
+                    const auto& local_bnd = ContourGraph::local_boundary_;
+                    // Filter to edges within local_planner_range
+                    std::vector<std::pair<Point3D, Point3D>> bnd_edges;
+                    for (const auto& edge : local_bnd) {
+                        if (FARUtil::DistanceToLineSeg2D(robot_pos, edge) <= local_planner_range) {
+                            bnd_edges.push_back({edge.first, edge.second});
+                        }
+                    }
+                    if (!bnd_edges.empty()) {
+                        nav_msgs::Path bnd_msg;
+                        bnd_msg.header = dimos::make_header(g_world_frame, now_sec);
+                        bnd_msg.poses_length = static_cast<int32_t>(bnd_edges.size() * 2);
+                        bnd_msg.poses.resize(bnd_edges.size() * 2);
+                        for (size_t i = 0; i < bnd_edges.size(); ++i) {
+                            auto& p1 = bnd_msg.poses[i * 2];
+                            auto& p2 = bnd_msg.poses[i * 2 + 1];
+                            p1.header = bnd_msg.header;
+                            p2.header = bnd_msg.header;
+                            p1.pose.position.x = bnd_edges[i].first.x;
+                            p1.pose.position.y = bnd_edges[i].first.y;
+                            p1.pose.position.z = bnd_edges[i].first.z;
+                            p1.pose.orientation.w = 1.0;
+                            p2.pose.position.x = bnd_edges[i].second.x;
+                            p2.pose.position.y = bnd_edges[i].second.y;
+                            p2.pose.position.z = bnd_edges[i].second.z;
+                            p2.pose.orientation.w = 1.0;
+                        }
+                        g_lcm->publish(g_nav_boundary_topic, &bnd_msg);
+                    }
+                }
+
+                // Publish debug visualization: graph nodes (as nav_msgs/Path, decoded as GraphNodes3D)
+                // orientation.w encodes node type: 0=normal, 1=odom, 2=goal, 3=frontier, 4=navpoint
+                if (!g_graph_nodes_topic.empty() && frame_count % 5 == 0) {
+                    const NodePtrStack& viz_graph = dynamic_graph.GetNavGraph();
+                    nav_msgs::Path nodes_msg;
+                    nodes_msg.header = dimos::make_header(g_world_frame, now_sec);
+                    nodes_msg.poses_length = static_cast<int32_t>(viz_graph.size());
+                    nodes_msg.poses.resize(viz_graph.size());
+                    for (size_t i = 0; i < viz_graph.size(); ++i) {
+                        const auto& n = viz_graph[i];
+                        auto& pose = nodes_msg.poses[i];
+                        pose.header = nodes_msg.header;
+                        pose.pose.position.x = n->position.x;
+                        pose.pose.position.y = n->position.y;
+                        pose.pose.position.z = n->position.z;
+                        float node_type = 0.0f;
+                        if (n->is_odom) node_type = 1.0f;
+                        else if (n->is_goal) node_type = 2.0f;
+                        else if (n->is_frontier) node_type = 3.0f;
+                        else if (n->is_navpoint) node_type = 4.0f;
+                        pose.pose.orientation.w = node_type;
+                    }
+                    g_lcm->publish(g_graph_nodes_topic, &nodes_msg);
+                }
+
+                // Publish debug visualization: graph edges (as nav_msgs/Path, decoded as LineSegments3D)
+                // Consecutive pose pairs form edge segments.
+                // orientation.w encodes traversability:
+                //   1.0 = both endpoints traversable (reachable from robot)
+                //   0.5 = one endpoint traversable
+                //   0.0 = neither endpoint traversable (unreachable)
+                if (!g_graph_edges_topic.empty() && frame_count % 5 == 0) {
+                    const NodePtrStack& viz_graph = dynamic_graph.GetNavGraph();
+                    // Collect unique edges with traversability label
+                    struct EdgeInfo { Point3D a, b; float trav; };
+                    std::vector<EdgeInfo> edges;
+                    for (const auto& n : viz_graph) {
+                        for (const auto& neighbor : n->connect_nodes) {
+                            if (n->id < neighbor->id) {
+                                float trav = 0.0f;
+                                if (n->is_traversable && neighbor->is_traversable) trav = 1.0f;
+                                else if (n->is_traversable || neighbor->is_traversable) trav = 0.5f;
+                                edges.push_back({n->position, neighbor->position, trav});
+                            }
+                        }
+                    }
+                    nav_msgs::Path edges_msg;
+                    edges_msg.header = dimos::make_header(g_world_frame, now_sec);
+                    edges_msg.poses_length = static_cast<int32_t>(edges.size() * 2);
+                    edges_msg.poses.resize(edges.size() * 2);
+                    for (size_t i = 0; i < edges.size(); ++i) {
+                        auto& p1 = edges_msg.poses[i * 2];
+                        auto& p2 = edges_msg.poses[i * 2 + 1];
+                        p1.header = edges_msg.header;
+                        p2.header = edges_msg.header;
+                        p1.pose.position.x = edges[i].a.x;
+                        p1.pose.position.y = edges[i].a.y;
+                        p1.pose.position.z = edges[i].a.z;
+                        p1.pose.orientation.w = edges[i].trav;
+                        p2.pose.position.x = edges[i].b.x;
+                        p2.pose.position.y = edges[i].b.y;
+                        p2.pose.position.z = edges[i].b.z;
+                        p2.pose.orientation.w = edges[i].trav;
+                    }
+                    g_lcm->publish(g_graph_edges_topic, &edges_msg);
+                }
+
+                // Publish debug visualization: contour polygons (as PointCloud2, decoded as ContourPolygons3D)
+                // Each polygon's vertices are points with intensity = polygon_id
+                if (!g_contour_polygons_topic.empty() && frame_count % 5 == 0) {
+                    const auto& polys = ContourGraph::GetContourPolygons();
+                    std::vector<smart_nav::PointXYZI> poly_pts;
+                    int non_pillar_id = 0;
+                    for (size_t pid = 0; pid < polys.size(); ++pid) {
+                        const auto& poly = polys[pid];
+                        if (poly->is_pillar) continue;
+                        float poly_id = static_cast<float>(non_pillar_id++);
+                        for (const auto& v : poly->vertices) {
+                            poly_pts.push_back({v.x, v.y, v.z, poly_id});
+                        }
+                    }
+                    if (frame_count % 50 == 0) {
+                        printf("[far_planner] contour_polygons: total=%zu non_pillar=%d pts=%zu\n",
+                               polys.size(), non_pillar_id, poly_pts.size());
+                        fflush(stdout);
+                    }
+                    auto poly_msg = smart_nav::build_pointcloud2(poly_pts, g_world_frame, now_sec);
+                    g_lcm->publish(g_contour_polygons_topic, &poly_msg);
+                }
+            }
+        }
+
+        // ── Planning loop (mirrors FARMaster::PlanningCallBack) ────────────
+        // Matches the original FARMaster::PlanningCallBack order exactly.
+        // In the original, odom_node_ptr_ is set from previous timer iterations.
+        // In our single-loop design, we run a no-goal UpdateGraphTraverability
+        // every frame to keep odom_node_ptr_ warm for ReEvaluateGoalPosition.
+        const NavNodePtr goal_ptr = graph_planner.GetGoalNodePtr();
+        const NavNodePtr odom_node = dynamic_graph.GetOdomNode();
+        if (goal_ptr == nullptr && is_map_init && odom_node != nullptr) {
+            // No goal — still update graph + traversability (matches original line 281)
+            graph_planner.UpdaetVGraph(dynamic_graph.GetNavGraph());
+            graph_planner.UpdateGraphTraverability(odom_node, nullptr);
+        } else if (goal_ptr != nullptr && is_map_init && odom_node != nullptr) {
+            // Matches original FARMaster::PlanningCallBack order (lines 286-303):
+            // 1. UpdateFreeTerrainGrid
+            const Point3D ori_p = graph_planner.GetOriginNodePos(true);
+            PointCloudPtr goal_obs(new pcl::PointCloud<PCLPoint>());
+            PointCloudPtr goal_free(new pcl::PointCloud<PCLPoint>());
+            map_handler.GetCloudOfPoint(ori_p, goal_obs, CloudType::OBS_CLOUD, true);
+            map_handler.GetCloudOfPoint(ori_p, goal_free, CloudType::FREE_CLOUD, true);
+            graph_planner.UpdateFreeTerrainGrid(ori_p, goal_obs, goal_free);
+
+            // 2. ReEvaluateGoalPosition (uses odom_node_ptr_ from prev frame)
+            graph_planner.ReEvaluateGoalPosition(goal_ptr, !FARUtil::IsMultiLayer);
+
+            // 3. UpdateGoalNavNodeConnects — creates edges TO the goal node
+            graph_planner.UpdateGoalNavNodeConnects(goal_ptr);
+
+            // 4. UpdaetVGraph — MUST be after step 3 so goal edges are included
+            graph_planner.UpdaetVGraph(dynamic_graph.GetNavGraph());
+
+            // 5. UpdateGraphTraverability (Dijkstra — uses edges from steps 3+4)
+            graph_planner.UpdateGraphTraverability(odom_node, goal_ptr);
+
+            // Plan path to goal
             NodePtrStack global_path;
-            NavNodePtr nav_wp = nullptr;
-            Point3D cur_goal;
-            bool is_fail = false, is_succeed = false;
+            NavNodePtr nav_waypoint = nullptr;
+            Point3D goal_p;
+            bool is_fails = false;
+            bool is_succeed = false;
+            bool is_free_nav = false;
 
-            if (planner.PathToGoal(gp, global_path, nav_wp, cur_goal, is_fail, is_succeed) && nav_wp) {
-                // Publish graph-planned waypoint
-                geometry_msgs::PointStamped wp_msg;
-                wp_msg.header = dimos::make_header(G.worldFrameId,
-                    std::chrono::duration<double>(
-                        std::chrono::system_clock::now().time_since_epoch()).count());
-                wp_msg.point.x = nav_wp->position.x;
-                wp_msg.point.y = nav_wp->position.y;
-                wp_msg.point.z = nav_wp->position.z;
-                lcm.publish(topic_wp, &wp_msg);
+            bool plan_success = graph_planner.PathToGoal(
+                goal_ptr, global_path, nav_waypoint, goal_p,
+                is_fails, is_succeed, is_free_nav);
 
-                float dist_to_goal = (odom_node->position - cur_goal).norm();
-                if (verbose) {
-                    printf("[FAR] GRAPH PATH → wp=(%.2f,%.2f,%.2f)  "
-                           "path_nodes=%zu  graph_nodes=%zu  robot=(%.2f,%.2f)  "
-                           "goal=(%.2f,%.2f)  dist_to_goal=%.1fm  vg_time=%.1fms\n",
-                           nav_wp->position.x, nav_wp->position.y, nav_wp->position.z,
-                           global_path.size(), nav_graph.size(),
-                           odom_node->position.x, odom_node->position.y,
-                           cur_goal.x, cur_goal.y, dist_to_goal, vg_time);
-                    fflush(stdout);
-                }
-            } else if (is_fail) {
-                // Graph too sparse to plan — do NOT publish the goal
-                // directly as waypoint (that drives the robot into walls).
-                // Wait for the graph to grow via exploration or manual driving.
+            if (plan_success && nav_waypoint != nullptr) {
+                Point3D waypoint;
+                if (nav_waypoint != goal_ptr) {
+                    // Project waypoint away from obstacle surfaces (Algorithm 6 / Figure 14)
+                    // free_dist is updated by reference — shortened if wall hit
+                    float free_dist = local_planner_range;
+                    if (is_viewpoint_extend) {
+                        waypoint = ProjectWaypointFromObstacles(
+                            nav_waypoint, robot_pos, free_dist);
+                    } else {
+                        waypoint = nav_waypoint->position;
+                    }
 
-                // Count how many graph nodes are traversable and connected to goal
-                int traversable_count = 0, goal_connected = 0;
-                for (const auto& n : nav_graph) {
-                    if (n->is_traversable) traversable_count++;
-                }
-                for (const auto& cn : gp->connect_nodes) {
-                    (void)cn; goal_connected++;
+                    // Heading momentum (matches original ProjectNavWaypoint lines 392-411)
+                    bool is_momentum = (last_nav_node == nav_waypoint) ||
+                        (last_nav_node != nullptr &&
+                         (last_nav_node->position - nav_waypoint->position).norm() < FARUtil::kNearDist);
+                    const Point3D diff_p = waypoint - robot_pos;
+                    Point3D new_heading;
+                    if (is_momentum && nav_heading.norm() > FARUtil::kEpsilon) {
+                        const float hdist = free_dist / 2.0f;
+                        const float ratio = std::min(hdist, diff_p.norm()) / hdist;
+                        new_heading = diff_p.normalize() * ratio + nav_heading * (1.0f - ratio);
+                    } else {
+                        new_heading = diff_p.normalize();
+                    }
+                    if (nav_heading.norm() > FARUtil::kEpsilon && new_heading.norm_dot(nav_heading) < 0.0f) {
+                        Point3D temp_heading(nav_heading.y, -nav_heading.x, nav_heading.z);
+                        if (temp_heading.norm_dot(new_heading) < 0.0f) {
+                            temp_heading.x = -temp_heading.x;
+                            temp_heading.y = -temp_heading.y;
+                        }
+                        new_heading = temp_heading;
+                    }
+                    nav_heading = new_heading.normalize();
+                    if (diff_p.norm() < free_dist) {
+                        waypoint = waypoint + nav_heading * (free_dist - diff_p.norm());
+                    }
+                } else {
+                    // Waypoint IS the goal — use goal position directly.
+                    // No projection, no heading momentum extension.
+                    // (Matches original lines 315-318: only project non-goal waypoints)
+                    waypoint = goal_ptr->position;
+                    nav_heading = Point3D(0, 0, 0);
                 }
 
-                if (verbose) {
-                    printf("[FAR] NO ROUTE → goal=(%.2f,%.2f,%.2f)  "
-                           "robot=(%.2f,%.2f)  graph_nodes=%zu  traversable=%d  "
-                           "goal_edges=%d  dist=%.1fm\n",
-                           cur_goal.x, cur_goal.y, cur_goal.z,
-                           odom_node->position.x, odom_node->position.y,
-                           nav_graph.size(), traversable_count, goal_connected,
-                           (odom_node->position - cur_goal).norm());
-                    fflush(stdout);
+                // Churn reduction: only publish if waypoint moved significantly
+                // or the nav node changed. Set wp_churn_dist=0 to disable.
+                const float wp_change_dist = (waypoint - last_published_waypoint).norm();
+                const bool nav_node_changed = (nav_waypoint != last_nav_node);
+                const bool should_publish = !has_published_waypoint ||
+                    nav_node_changed ||
+                    (g_wp_churn_dist > 0 ? wp_change_dist > g_wp_churn_dist : true);
+
+                if (should_publish) {
+                    if (!g_way_point_topic.empty()) {
+                        auto wp_msg = point3d_to_lcm_point_stamped(waypoint, now_sec);
+                        g_lcm->publish(g_way_point_topic, &wp_msg);
+                    }
+                    if (!g_goal_path_topic.empty() && !global_path.empty()) {
+                        auto path_msg = path_to_lcm_path(global_path, now_sec);
+                        g_lcm->publish(g_goal_path_topic, &path_msg);
+                    }
+                    last_published_waypoint = waypoint;
+                    has_published_waypoint = true;
+                    last_nav_node = nav_waypoint;
                 }
+            } else if (is_fails) {
+                // Planning failed — publish robot position as waypoint to stop movement
+                if (!g_way_point_topic.empty()) {
+                    auto wp_msg = point3d_to_lcm_point_stamped(robot_pos, now_sec);
+                    g_lcm->publish(g_way_point_topic, &wp_msg);
+                }
+                has_published_waypoint = false;
+                last_nav_node = nullptr;
             }
 
             if (is_succeed) {
-                printf("[FAR] *** GOAL REACHED *** at (%.2f,%.2f)  "
-                       "goal was (%.2f,%.2f)  graph_nodes=%zu\n",
-                       odom_node->position.x, odom_node->position.y,
-                       cur_goal.x, cur_goal.y, nav_graph.size());
-                fflush(stdout);
+                has_pending_goal = false;
+                has_published_waypoint = false;
+                last_nav_node = nullptr;
+                printf("[far_planner] Goal reached!\n"); fflush(stdout);
             }
+        }
+
+        frame_count++;
+        last_robot_pos = robot_pos;
+
+        // ── Rate control ───────────────────────────────────────────────────
+        auto elapsed = std::chrono::high_resolution_clock::now() - loop_start;
+        auto elapsed_ms = std::chrono::duration<float, std::milli>(elapsed).count();
+        if (elapsed_ms < loop_period_ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                static_cast<int>(loop_period_ms - elapsed_ms)));
         }
     }
 
-    printf("[FAR] Shutdown complete.\n");
+    printf("[far_planner] Shutting down\n");
+    g_lcm = nullptr;
     return 0;
 }
