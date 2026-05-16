@@ -639,6 +639,12 @@ int main(int argc, char** argv) {
     printf("[far_planner] Starting main loop at %.1f Hz\n", update_rate);
     fflush(stdout);
 
+    // NativeModule.start() in Python reads stderr for this marker and only
+    // returns once it sees it. Without this, upstream publishers can race
+    // ahead and emit messages before our LCM subscriptions are live.
+    fprintf(stderr, "[DIMOS_NATIVE_READY]\n");
+    fflush(stderr);
+
     while (g_running.load()) {
         auto loop_start = std::chrono::high_resolution_clock::now();
 
