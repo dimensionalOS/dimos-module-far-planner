@@ -43,7 +43,7 @@
 
 // SmartNav common helpers
 #include "dimos_native_module.hpp"
-#include "msgs/GraphNodes3D.hpp"
+#include "msgs/Graph3D.hpp"
 #include "msgs/LineSegments3D.hpp"
 #include "point_cloud_utils.hpp"
 
@@ -421,8 +421,7 @@ int main(int argc, char** argv) {
     g_goal_path_topic       = mod.has("goal_path") ? mod.topic("goal_path") : "";
 
     // Debug visualization topics
-    std::string g_graph_nodes_topic = mod.has("graph_nodes") ? mod.topic("graph_nodes") : "";
-    std::string g_graph_edges_topic = mod.has("graph_edges") ? mod.topic("graph_edges") : "";
+    std::string g_graph_topic = mod.has("graph") ? mod.topic("graph") : "";
     std::string g_contour_polygons_topic = mod.has("contour_polygons") ? mod.topic("contour_polygons") : "";
     std::string g_nav_boundary_topic = mod.has("nav_boundary") ? mod.topic("nav_boundary") : "";
 
@@ -981,41 +980,38 @@ int main(int argc, char** argv) {
                     }
                 }
 
-                // Publish debug visualization: graph nodes (decoded on Python side as GraphNodes3D).
-                if (!g_graph_nodes_topic.empty() && frame_count % 5 == 0) {
+                // Publish debug visualization: visibility graph as Graph3D.
+                // Node metadata_id: 0=normal, 1=odom, 2=goal, 3=frontier, 4=navpoint.
+                // Edge metadata_id: 0=non-traversable, 1=partial, 2=both endpoints traversable.
+                if (!g_graph_topic.empty() && frame_count % 5 == 0) {
                     const NodePtrStack& viz_graph = dynamic_graph.GetNavGraph();
-                    dimos::GraphNodes3D nodes_msg(g_world_frame, now_sec);
-                    nodes_msg.reserve(viz_graph.size());
+                    dimos::Graph3D graph_msg(g_world_frame, now_sec);
+                    graph_msg.reserve_nodes(viz_graph.size());
                     for (const auto& n : viz_graph) {
-                        int32_t node_type = dimos::GraphNodes3D::NORMAL;
-                        if (n->is_odom) node_type = dimos::GraphNodes3D::ODOM;
-                        else if (n->is_goal) node_type = dimos::GraphNodes3D::GOAL;
-                        else if (n->is_frontier) node_type = dimos::GraphNodes3D::FRONTIER;
-                        else if (n->is_navpoint) node_type = dimos::GraphNodes3D::NAVPOINT;
-                        nodes_msg.add(n->position.x, n->position.y, n->position.z, node_type);
+                        uint64_t node_type = 0;  // normal
+                        if (n->is_odom) node_type = 1;
+                        else if (n->is_goal) node_type = 2;
+                        else if (n->is_frontier) node_type = 3;
+                        else if (n->is_navpoint) node_type = 4;
+                        graph_msg.add_node_xyz(
+                            static_cast<uint64_t>(n->id), node_type, now_sec,
+                            n->position.x, n->position.y, n->position.z);
                     }
-                    nodes_msg.publish(*g_lcm, g_graph_nodes_topic);
-                }
-
-                // Publish debug visualization: graph edges (decoded on Python side as LineSegments3D).
-                // Traversability: 1.0 = both endpoints traversable, 0.5 = one, 0.0 = neither.
-                if (!g_graph_edges_topic.empty() && frame_count % 5 == 0) {
-                    const NodePtrStack& viz_graph = dynamic_graph.GetNavGraph();
-                    dimos::LineSegments3D edges_msg(g_world_frame, now_sec);
                     for (const auto& n : viz_graph) {
                         for (const auto& neighbor : n->connect_nodes) {
                             if (n->id < neighbor->id) {
-                                float trav = 0.0f;
-                                if (n->is_traversable && neighbor->is_traversable) trav = 1.0f;
-                                else if (n->is_traversable || neighbor->is_traversable) trav = 0.5f;
-                                edges_msg.add(
-                                    n->position.x, n->position.y, n->position.z,
-                                    neighbor->position.x, neighbor->position.y, neighbor->position.z,
-                                    trav);
+                                uint64_t edge_metadata = 0;  // non-traversable
+                                if (n->is_traversable && neighbor->is_traversable) edge_metadata = 2;
+                                else if (n->is_traversable || neighbor->is_traversable) edge_metadata = 1;
+                                graph_msg.add_edge(
+                                    static_cast<uint64_t>(n->id),
+                                    static_cast<uint64_t>(neighbor->id),
+                                    now_sec,
+                                    edge_metadata);
                             }
                         }
                     }
-                    edges_msg.publish(*g_lcm, g_graph_edges_topic);
+                    graph_msg.publish(*g_lcm, g_graph_topic);
                 }
 
                 // Publish debug visualization: contour polygons (as PointCloud2, decoded as ContourPolygons3D)
