@@ -43,6 +43,8 @@
 
 // SmartNav common helpers
 #include "dimos_native_module.hpp"
+#include "msgs/GraphNodes3D.hpp"
+#include "msgs/LineSegments3D.hpp"
 #include "point_cloud_utils.hpp"
 
 // FAR Planner core (via compat layer — no ROS deps)
@@ -968,93 +970,52 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (!bnd_edges.empty()) {
-                        nav_msgs::Path bnd_msg;
-                        bnd_msg.header = dimos::make_header(g_world_frame, now_sec);
-                        bnd_msg.poses_length = static_cast<int32_t>(bnd_edges.size() * 2);
-                        bnd_msg.poses.resize(bnd_edges.size() * 2);
-                        for (size_t i = 0; i < bnd_edges.size(); ++i) {
-                            auto& p1 = bnd_msg.poses[i * 2];
-                            auto& p2 = bnd_msg.poses[i * 2 + 1];
-                            p1.header = bnd_msg.header;
-                            p2.header = bnd_msg.header;
-                            p1.pose.position.x = bnd_edges[i].first.x;
-                            p1.pose.position.y = bnd_edges[i].first.y;
-                            p1.pose.position.z = bnd_edges[i].first.z;
-                            p1.pose.orientation.w = 1.0;
-                            p2.pose.position.x = bnd_edges[i].second.x;
-                            p2.pose.position.y = bnd_edges[i].second.y;
-                            p2.pose.position.z = bnd_edges[i].second.z;
-                            p2.pose.orientation.w = 1.0;
+                        dimos::LineSegments3D bnd_msg(g_world_frame, now_sec);
+                        bnd_msg.reserve(bnd_edges.size());
+                        for (const auto& e : bnd_edges) {
+                            bnd_msg.add(
+                                e.first.x, e.first.y, e.first.z,
+                                e.second.x, e.second.y, e.second.z);
                         }
-                        g_lcm->publish(g_nav_boundary_topic, &bnd_msg);
+                        bnd_msg.publish(*g_lcm, g_nav_boundary_topic);
                     }
                 }
 
-                // Publish debug visualization: graph nodes (as nav_msgs/Path, decoded as GraphNodes3D)
-                // orientation.w encodes node type: 0=normal, 1=odom, 2=goal, 3=frontier, 4=navpoint
+                // Publish debug visualization: graph nodes (decoded on Python side as GraphNodes3D).
                 if (!g_graph_nodes_topic.empty() && frame_count % 5 == 0) {
                     const NodePtrStack& viz_graph = dynamic_graph.GetNavGraph();
-                    nav_msgs::Path nodes_msg;
-                    nodes_msg.header = dimos::make_header(g_world_frame, now_sec);
-                    nodes_msg.poses_length = static_cast<int32_t>(viz_graph.size());
-                    nodes_msg.poses.resize(viz_graph.size());
-                    for (size_t i = 0; i < viz_graph.size(); ++i) {
-                        const auto& n = viz_graph[i];
-                        auto& pose = nodes_msg.poses[i];
-                        pose.header = nodes_msg.header;
-                        pose.pose.position.x = n->position.x;
-                        pose.pose.position.y = n->position.y;
-                        pose.pose.position.z = n->position.z;
-                        float node_type = 0.0f;
-                        if (n->is_odom) node_type = 1.0f;
-                        else if (n->is_goal) node_type = 2.0f;
-                        else if (n->is_frontier) node_type = 3.0f;
-                        else if (n->is_navpoint) node_type = 4.0f;
-                        pose.pose.orientation.w = node_type;
+                    dimos::GraphNodes3D nodes_msg(g_world_frame, now_sec);
+                    nodes_msg.reserve(viz_graph.size());
+                    for (const auto& n : viz_graph) {
+                        int32_t node_type = dimos::GraphNodes3D::NORMAL;
+                        if (n->is_odom) node_type = dimos::GraphNodes3D::ODOM;
+                        else if (n->is_goal) node_type = dimos::GraphNodes3D::GOAL;
+                        else if (n->is_frontier) node_type = dimos::GraphNodes3D::FRONTIER;
+                        else if (n->is_navpoint) node_type = dimos::GraphNodes3D::NAVPOINT;
+                        nodes_msg.add(n->position.x, n->position.y, n->position.z, node_type);
                     }
-                    g_lcm->publish(g_graph_nodes_topic, &nodes_msg);
+                    nodes_msg.publish(*g_lcm, g_graph_nodes_topic);
                 }
 
-                // Publish debug visualization: graph edges (as nav_msgs/Path, decoded as LineSegments3D)
-                // Consecutive pose pairs form edge segments.
-                // orientation.w encodes traversability:
-                //   1.0 = both endpoints traversable (reachable from robot)
-                //   0.5 = one endpoint traversable
-                //   0.0 = neither endpoint traversable (unreachable)
+                // Publish debug visualization: graph edges (decoded on Python side as LineSegments3D).
+                // Traversability: 1.0 = both endpoints traversable, 0.5 = one, 0.0 = neither.
                 if (!g_graph_edges_topic.empty() && frame_count % 5 == 0) {
                     const NodePtrStack& viz_graph = dynamic_graph.GetNavGraph();
-                    // Collect unique edges with traversability label
-                    struct EdgeInfo { Point3D a, b; float trav; };
-                    std::vector<EdgeInfo> edges;
+                    dimos::LineSegments3D edges_msg(g_world_frame, now_sec);
                     for (const auto& n : viz_graph) {
                         for (const auto& neighbor : n->connect_nodes) {
                             if (n->id < neighbor->id) {
                                 float trav = 0.0f;
                                 if (n->is_traversable && neighbor->is_traversable) trav = 1.0f;
                                 else if (n->is_traversable || neighbor->is_traversable) trav = 0.5f;
-                                edges.push_back({n->position, neighbor->position, trav});
+                                edges_msg.add(
+                                    n->position.x, n->position.y, n->position.z,
+                                    neighbor->position.x, neighbor->position.y, neighbor->position.z,
+                                    trav);
                             }
                         }
                     }
-                    nav_msgs::Path edges_msg;
-                    edges_msg.header = dimos::make_header(g_world_frame, now_sec);
-                    edges_msg.poses_length = static_cast<int32_t>(edges.size() * 2);
-                    edges_msg.poses.resize(edges.size() * 2);
-                    for (size_t i = 0; i < edges.size(); ++i) {
-                        auto& p1 = edges_msg.poses[i * 2];
-                        auto& p2 = edges_msg.poses[i * 2 + 1];
-                        p1.header = edges_msg.header;
-                        p2.header = edges_msg.header;
-                        p1.pose.position.x = edges[i].a.x;
-                        p1.pose.position.y = edges[i].a.y;
-                        p1.pose.position.z = edges[i].a.z;
-                        p1.pose.orientation.w = edges[i].trav;
-                        p2.pose.position.x = edges[i].b.x;
-                        p2.pose.position.y = edges[i].b.y;
-                        p2.pose.position.z = edges[i].b.z;
-                        p2.pose.orientation.w = edges[i].trav;
-                    }
-                    g_lcm->publish(g_graph_edges_topic, &edges_msg);
+                    edges_msg.publish(*g_lcm, g_graph_edges_topic);
                 }
 
                 // Publish debug visualization: contour polygons (as PointCloud2, decoded as ContourPolygons3D)
