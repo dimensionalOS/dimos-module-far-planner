@@ -29,10 +29,19 @@
           '';
         });
 
-        # PCL without VTK (avoids tiledb/pdal build failures)
-        pcl-minimal = pkgs.pcl.override {
+        # PCL without VTK (avoids tiledb/pdal build failures) and without
+        # OpenNI grabbers. PCL 1.15.1's CMake auto-enables WITH_OPENNI on
+        # Linux without putting the openni package on the include path, so
+        # io/openni_camera/openni.h fails to find XnOS.h. We don't use the
+        # grabber.
+        pcl-minimal = (pkgs.pcl.override {
           vtk = null;
-        };
+        }).overrideAttrs (old: {
+          cmakeFlags = (old.cmakeFlags or []) ++ [
+            "-DWITH_OPENNI=OFF"
+            "-DWITH_OPENNI2=OFF"
+          ];
+        });
 
         smart-nav-common = ./common;
 
